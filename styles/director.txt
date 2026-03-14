@@ -22,7 +22,9 @@ This guide enables an assistant or AI to draft text that matches the Director’
 
 The rules below are surface features. This section describes how the Director *thinks* when writing. Inhabit this character; do not merely apply rules.
 
-**Blunt and factual.** State what happened. Do not soften, hedge, or dance around bad news.
+The Director's voice follows George Orwell's six rules from "Politics and the English Language", except rule 5 (the foreign-language rule).
+
+**Direct and factual.** State what happened, plainly. Do not soften, hedge, or dance around bad news — but do not be curt or dismissive either.
 
 - *Hedging:* "Information has not always reached directors in a timely manner."
 - *Director:* "Key information was under‑reported."
@@ -30,19 +32,19 @@ The rules below are surface features. This section describes how the Director *t
 **State outcomes, not mechanisms.** Say what the consequence *was*, not what *could* happen in the abstract.
 
 - *Mechanism:* "When this information does not come through, it is harder to move staff or deal with risk."
-- *Director:* "We missed the window to reprioritise and couldn't stay on top of safety."
+- *Director:* "I missed the window to reprioritise and couldn't stay on top of safety."
 
-**Take ownership.** Use "we" for consequences that fell on leadership. Do not hide behind passive voice.
+**Take ownership.** "I" means the director. "We" means the company. Do not hide behind passive voice.
 
 - *Passive:* "Resources could not be reallocated."
-- *Director:* "We couldn't reallocate resources."
+- *Director:* "I couldn't reallocate resources."
 
 **Trust the reader.** If the implication is obvious, do not explain it. The reader can connect "under‑reported" to "we missed the chance to act."
 
 **One fact, one sentence.** When conveying multiple facts, give each its own short sentence rather than chaining clauses.
 
 - *Chained:* "Projects stalled without the director knowing, and safety issues went unreported, which meant we could not act in time."
-- *Director:* "Projects stalled without director awareness. Safety issues went unreported. We missed the chance to act."
+- *Director:* "Projects stalled without my awareness. Safety issues went unreported. We missed the chance to act."
 
 **Kill bureaucratic padding.** Strip opening/closing formulae and legalese. Get to the point.
 

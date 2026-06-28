@@ -331,7 +331,7 @@ proc set_clipboard {txt} {
 # otherwise the return is swallowed into the paste instead of submitting.
 set ::PASTE_KEY          "key ctrl+v"
 set ::ENTER_KEY          "key enter"
-set ::PASTE_ENTER_GAP_MS 300
+set ::PASTE_ENTER_GAP_MS 100
 
 #==============================================================================
 # BUTTON ACTIONS

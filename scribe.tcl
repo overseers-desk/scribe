@@ -1,0 +1,918 @@
+#!/usr/bin/env wish9.0
+package require Tk 9
+
+# Scribe — take dictation or clipboard text, optionally restyle it, and deliver
+# it by typing, pasting, or leaving it on the clipboard.
+#
+# Behaviour is five independent axes; reading the flags tells the whole story:
+#   --input  mic | clipboard               where the text comes from
+#   --window | --no-window                 review window, or unattended
+#   --deliver type | paste | clipboard     how the result leaves
+#   --style[=NAME]                         apply a style pass (omit = raw)
+#   --quotes double|single|straight  --dialect off|british   normalisation
+#
+# Legacy tools are presets:
+#   dictate            : --input mic --no-window --deliver type
+#   dictate-stylist    : --input mic --window --style --auto-style-delay 1000 --deliver paste
+#   language-stylist   : --input clipboard --window --style --auto-style-delay 1 --deliver clipboard
+#
+# Bind presets to GNOME custom shortcuts launching the custom Wayland wish with
+# LD_LIBRARY_PATH set, the way the companion dictation tool is bound.
+#
+# Requires: dotool, whisper-cli, parecord (PulseAudio), wl-copy (wl-clipboard).
+
+#==============================================================================
+# CONFIGURATION
+#==============================================================================
+
+set ::APP_DIR          [file dirname [file normalize [info script]]]
+set ::DEEPSEEK_CONFIG  [file join $::APP_DIR "deepseek.json"]
+set ::STYLES_DIR       [file join $::APP_DIR "styles"]
+set ::SYSTEM_PROMPTS   [file join $::APP_DIR "system-prompts.yaml"]
+set ::CONFIG_FILE      [file join $::APP_DIR "current-mode.conf"]
+set ::DIALECT_FILE     [file join $::APP_DIR "dialect-us-to-british.tsv"]
+set ::LOG_DIR          /var/local/log/dictation
+set ::CACHE_DIR        [file join [expr {[info exists ::env(XDG_CACHE_HOME)] && $::env(XDG_CACHE_HOME) ne "" ? $::env(XDG_CACHE_HOME) : "$::env(HOME)/.cache"}] scribe]
+
+set ::PORT             4212
+set ::APPNAME          "scribe-[pid]"
+
+# --- axes ---
+set ::INPUT            ""          ;# mic | clipboard
+set ::WINDOW           1
+set ::DELIVER          paste       ;# type | paste | clipboard
+set ::STYLE_ON         0
+set ::STYLE_NAME       ""
+set ::STYLE_AUTO       ""          ;# "" = manual; integer ms = auto after delay
+set ::QUOTES           ""          ;# "" = unset (resolve from dialect) | double | single | straight
+set ::QSTYLE           double      ;# resolved: double | single | straight
+set ::DIALECT          off         ;# off | british
+
+# --- whisper / recording ---
+set ::MODEL            "$::env(HOME)/code/whisper.cpp/models/ggml-medium.en.bin"
+set ::LANG             en
+set ::TIMEOUT_S        300
+set ::THREADS          4
+set ::CAPTURE          ""
+set ::PROMPT           ""
+set ::NO_FALLBACK      1
+set ::NO_GPU           0
+set ::FLASH_ATTN       0
+set ::NO_FLASH_ATTN    0
+set ::PRINT_SPECIAL    0
+set ::KEY_DELAY        2
+set ::WORD_DELAY       100
+set ::CMD              stop
+set ::debug_mode       0
+
+# --- paste/enter (window UI trick) ---
+set ::PASTE_KEY          "key ctrl+v"
+set ::ENTER_KEY          "key enter"
+set ::PASTE_ENTER_GAP_MS 100
+
+# --- test hooks ---
+set ::TEST_TEXT        ""
+set ::TEST_FILE        ""
+set ::SELF_TEST        0
+
+# --- DeepSeek ---
+set ::apiKey  ""
+set ::apiBase ""
+set ::apiModel ""
+set ::userTextPrefix   ""
+set ::singlePassPrefix ""
+set ::styleGuide       ""
+
+# --- runtime ---
+set ::parecord_pid  0
+set ::tmpfile       ""
+set ::log_stem      ""
+set ::auto_stop_id  ""
+set ::poll_id       ""
+set ::start_ms      0
+set ::state         idle
+set ::done          0
+set ::httpToken     ""
+set ::autosend_id   ""
+set ::dotool_pid    0
+set ::dotool_id     ""
+set ::ukmap         ""
+
+# --- review ---
+set ::sourceText    ""
+set ::rewriteText   ""
+set ::activeArea    1
+set ::rewriteState  idle
+
+#==============================================================================
+# ARGUMENT PARSING
+#==============================================================================
+
+proc fatal {msg} { puts stderr "scribe: $msg"; exit 1 }
+
+set prompt_seen 0
+for {set i 0} {$i < [llength $::argv]} {incr i} {
+    set arg [lindex $::argv $i]
+    switch -- $arg {
+        --input            { set ::INPUT [lindex $::argv [incr i]] }
+        --window           { set ::WINDOW 1 }
+        --no-window        { set ::WINDOW 0 }
+        --deliver          { set ::DELIVER [lindex $::argv [incr i]] }
+        --style            { set ::STYLE_ON 1 }
+        --auto-style-delay { set ::STYLE_ON 1; set ::STYLE_AUTO [lindex $::argv [incr i]] }
+        --quotes           { set ::QUOTES [lindex $::argv [incr i]] }
+        --dialect          { set ::DIALECT [lindex $::argv [incr i]] }
+        -m  - --model      { set ::MODEL     [lindex $::argv [incr i]] }
+        -l  - --language   { set ::LANG      [lindex $::argv [incr i]] }
+        -t  - --threads    { set ::THREADS   [lindex $::argv [incr i]] }
+        -c  - --capture    { set ::CAPTURE   [lindex $::argv [incr i]] }
+        -to - --timeout    { set ::TIMEOUT_S [lindex $::argv [incr i]] }
+        --key-delay        { set ::KEY_DELAY  [lindex $::argv [incr i]] }
+        --word-delay       { set ::WORD_DELAY [lindex $::argv [incr i]] }
+        --prompt {
+            if {$prompt_seen} { fatal "--prompt and --prompt-file are mutually exclusive" }
+            set prompt_seen 1; set ::PROMPT [lindex $::argv [incr i]]
+        }
+        --prompt-file {
+            if {$prompt_seen} { fatal "--prompt and --prompt-file are mutually exclusive" }
+            set prompt_seen 1
+            set pf [lindex $::argv [incr i]]
+            if {[catch {set fh [open $pf r]; set ::PROMPT [string trim [read $fh]]; close $fh} err]} {
+                fatal "cannot read --prompt-file $pf: $err"
+            }
+        }
+        -nf  - --no-fallback   { set ::NO_FALLBACK 1 }
+        -ng  - --no-gpu        { set ::NO_GPU 1 }
+        -fa  - --flash-attn    { set ::FLASH_ATTN 1 }
+        -nfa - --no-flash-attn { set ::NO_FLASH_ATTN 1 }
+        -ps  - --print-special { set ::PRINT_SPECIAL 1 }
+        --debug      { set ::debug_mode 1 }
+        --self-test  { set ::SELF_TEST 1 }
+        --test-text  { set ::TEST_TEXT [lindex $::argv [incr i]] }
+        -tf - --test-file { set ::TEST_FILE [lindex $::argv [incr i]] }
+        --cmd {
+            set ::CMD [lindex $::argv [incr i]]
+            if {$::CMD ni {stop status pause resume}} { fatal "--cmd must be stop|status|pause|resume" }
+        }
+        -h - --help {
+            puts "Usage: scribe \[options\]"
+            puts "  --input mic|clipboard          source (required with --no-window)"
+            puts "  --window | --no-window         draw the review window, or run unattended"
+            puts "  --deliver type|paste|clipboard how the result leaves (default paste)"
+            puts "  --style\[=NAME\]                 apply a style pass (omit = raw)"
+            puts "  --auto-style-delay MS          (window) auto-style after MS ms; 1 = immediate"
+            puts "  --quotes double|single|straight   double: “ ” · single: ‘ ’ · straight: ASCII"
+            puts "  --dialect off|british          british: US→UK spelling; default quotes -> single"
+            puts "  mic: -m -l -t -to -c --prompt|--prompt-file --key-delay --word-delay -nf -ng -fa -ps"
+            puts "  --cmd stop|status|pause|resume  --debug --self-test --test-text S --test-file WAV"
+            exit 0
+        }
+        default { fatal "unknown argument: $arg" }
+    }
+}
+
+proc dbg {msg} { if {$::debug_mode} { puts stderr "scribe \[debug\]: $msg" } }
+
+#==============================================================================
+# CONFIG LOADING
+#==============================================================================
+
+proc loadDeepSeekConfig {} {
+    if {![file exists $::DEEPSEEK_CONFIG]} { fatal "missing deepseek.json at $::DEEPSEEK_CONFIG" }
+    if {[catch {
+        package require json
+        set f [open $::DEEPSEEK_CONFIG r]; set data [read $f]; close $f
+        set cfg [json::json2dict $data]
+        set ::apiKey   [expr {[dict exists $cfg api_key]  ? [dict get $cfg api_key]  : ""}]
+        set ::apiBase  [expr {[dict exists $cfg api_base] ? [dict get $cfg api_base] : "https://api.deepseek.com"}]
+        set ::apiModel [expr {[dict exists $cfg model]    ? [dict get $cfg model]    : "deepseek-chat"}]
+    } err]} { fatal "error loading deepseek.json: $err" }
+    if {$::apiKey eq ""} { fatal "api_key not found in deepseek.json" }
+}
+
+proc loadSystemPrompts {} {
+    if {![file exists $::SYSTEM_PROMPTS]} { fatal "missing system-prompts.yaml" }
+    if {[catch {
+        package require yaml
+        set f [open $::SYSTEM_PROMPTS r]; set data [read $f]; close $f
+        set cfg [yaml::yaml2dict $data]
+        set ::userTextPrefix   [expr {[dict exists $cfg user_text_prefix]   ? [dict get $cfg user_text_prefix]   : ""}]
+        set ::singlePassPrefix [expr {[dict exists $cfg single_pass_prefix] ? [dict get $cfg single_pass_prefix] : ""}]
+    } err]} { fatal "error loading system-prompts.yaml: $err" }
+}
+
+proc loadStyle {} {
+    set name $::STYLE_NAME
+    if {$name eq ""} {
+        set name "clear"
+        if {[file exists $::CONFIG_FILE]} {
+            catch { set f [open $::CONFIG_FILE r]; set name [string trim [read $f]]; close $f }
+        }
+        if {$name eq ""} { set name "clear" }
+    }
+    set path [file join $::STYLES_DIR "$name.txt"]
+    if {![file exists $path]} {
+        set files [lsort [glob -nocomplain -directory $::STYLES_DIR *.txt]]
+        if {[llength $files] == 0} { fatal "no style files in $::STYLES_DIR" }
+        set path [lindex $files 0]; set name [file rootname [file tail $path]]
+    }
+    set f [open $path r]; set ::styleGuide [read $f]; close $f
+    set ::STYLE_NAME $name
+    dbg "style = $name"
+}
+
+#==============================================================================
+# TEXT NORMALISATION: quotes + dialect
+#==============================================================================
+
+# style ∈ {double, single}: apostrophe/elision -> ’; quotations -> “ ” or ‘ ’.
+proc smarten_quotes {text style} {
+    set openers [list ( \[ \{]
+    if {$style eq "single"} { set qo "‘"; set qc "’" } else { set qo "“"; set qc "”" }
+    set out ""
+    set n [string length $text]
+    for {set i 0} {$i < $n} {incr i} {
+        set ch [string index $text $i]
+        if {$ch eq "\""} {
+            if {$i == 0} {
+                set open 1
+            } else {
+                set prev [string index $text [expr {$i - 1}]]
+                set open [expr {[string is space -strict $prev] || $prev in $openers}]
+            }
+            append out [expr {$open ? $qo : $qc}]
+        } elseif {$ch eq "'"} {
+            append out "’"
+        } else {
+            append out $ch
+        }
+    }
+    return $out
+}
+
+proc loadDialect {} {
+    set ::ukmap [dict create]
+    if {![file exists $::DIALECT_FILE]} { return }
+    catch {
+        set f [open $::DIALECT_FILE r]; set data [read $f]; close $f
+        foreach line [split $data \n] {
+            if {$line eq "" || [string index $line 0] eq "#"} continue
+            set cols [split $line \t]
+            if {[llength $cols] < 2} continue
+            dict set ::ukmap [string tolower [string trim [lindex $cols 0]]] [string trim [lindex $cols 1]]
+        }
+    }
+}
+
+# Words that end in -ize but are not -ise in British English.
+set ::IZE_EXCEPTIONS {capsize downsize upsize oversize resize size prize seize maize baize assize}
+proc britishize_word {lower} {
+    if {[dict exists $::ukmap $lower]} { return [dict get $::ukmap $lower] }
+    if {$lower in $::IZE_EXCEPTIONS} { return $lower }
+    foreach {pat repl} {
+        {^(.{3,})izations$} isations
+        {^(.{3,})ization$}  isation
+        {^(.{3,})izing$}    ising
+        {^(.{3,})ized$}     ised
+        {^(.{3,})izes$}     ises
+        {^(.{3,})ize$}      ise
+        {^(.{3,})yzing$}    ysing
+        {^(.{3,})yzed$}     ysed
+        {^(.{3,})yzes$}     yses
+        {^(.{3,})yze$}      yse
+    } {
+        if {[regexp $pat $lower -> stem]} { return "${stem}${repl}" }
+    }
+    return $lower
+}
+
+proc apply_case {orig mapped} {
+    if {$orig eq $mapped} { return $orig }
+    if {$orig eq [string toupper $orig]} { return [string toupper $mapped] }
+    if {[string index $orig 0] eq [string toupper [string index $orig 0]]} {
+        return "[string toupper [string index $mapped 0]][string range $mapped 1 end]"
+    }
+    return $mapped
+}
+
+proc britishize {text} {
+    set out ""
+    foreach tok [regexp -all -inline {[A-Za-z]+|[^A-Za-z]+} $text] {
+        if {[regexp {^[A-Za-z]+$} $tok]} {
+            append out [apply_case $tok [britishize_word [string tolower $tok]]]
+        } else {
+            append out $tok
+        }
+    }
+    return $out
+}
+
+proc normalize_text {text} {
+    if {$::QSTYLE ne "straight"} { set text [smarten_quotes $text $::QSTYLE] }
+    if {$::DIALECT eq "british"} { set text [britishize $text] }
+    return $text
+}
+
+#==============================================================================
+# JSON + DEEPSEEK STYLE PASS
+#==============================================================================
+
+proc jsonEscape {str} {
+    set result ""
+    set len [string length $str]
+    for {set i 0} {$i < $len} {incr i} {
+        set char [string index $str $i]
+        set code [scan $char %c]
+        switch -- $char {
+            "\\" { append result "\\\\" }
+            "\"" { append result "\\\"" }
+            "\n" { append result "\\n" }
+            "\r" { append result "\\r" }
+            "\t" { append result "\\t" }
+            "\b" { append result "\\b" }
+            "\f" { append result "\\f" }
+            default { if {$code < 32} { append result [format "\\u%04x" $code] } else { append result $char } }
+        }
+    }
+    return $result
+}
+
+proc buildJSONPayload {model systemPrompt userText} {
+    set json "\{\"model\":\"[jsonEscape $model]\","
+    append json "\"messages\":\["
+    append json "\{\"role\":\"system\",\"content\":\"[jsonEscape $systemPrompt]\"\},"
+    append json "\{\"role\":\"user\",\"content\":\"[jsonEscape $userText]\"\}"
+    append json "\],\"temperature\":0.7,\"max_tokens\":2000\}"
+    return $json
+}
+
+proc run_rewrite {} {
+    set ::autosend_id ""
+    if {$::rewriteState ni {idle error}} return
+    set ::rewriteState running
+    paneRewriteStatus "Styling…"
+    if {!$::WINDOW} { enter_state styling }
+
+    package require http
+    package require tls
+    if {[catch { ::tls::init -autoservername true; http::register https 443 [list ::tls::socket -autoservername true] }]} {
+        http::register https 443 ::tls::socket
+    }
+
+    set systemPrompt "${::singlePassPrefix}\n${::styleGuide}"
+    set wrappedText  "${::userTextPrefix}${::sourceText}\n"
+    set payload [encoding convertto utf-8 [buildJSONPayload $::apiModel $systemPrompt $wrappedText]]
+    set headers [list Authorization "Bearer $::apiKey" Content-Type "application/json; charset=utf-8"]
+    if {[catch {
+        set ::httpToken [http::geturl "${::apiBase}/chat/completions" \
+            -method POST -headers $headers -type "application/json" \
+            -query $payload -timeout 60000 -command handle_rewrite]
+    } err]} {
+        set ::rewriteState error; paneRewriteStatus "Error: $err"; signalTestDone; styleDone
+    }
+}
+
+proc handle_rewrite {token} {
+    set ::httpToken ""
+    set status [http::status $token]
+    set ncode  [http::ncode $token]
+    set data   [encoding convertfrom utf-8 [http::data $token]]
+    after idle [list http::cleanup $token]
+    if {$status ne "ok"} { set ::rewriteState error; paneRewriteStatus "Network error: $status"; signalTestDone; styleDone; return }
+    if {$ncode != 200}   { set ::rewriteState error; paneRewriteStatus "API error $ncode"; signalTestDone; styleDone; return }
+    if {[catch {
+        package require json
+        set resp [json::json2dict $data]
+        set content [dict get [lindex [dict get $resp choices] 0] message content]
+        set content [string map {— " - "} $content]
+        set ::rewriteText [normalize_text [string trim $content]]
+        set ::rewriteState done
+        paneSetRewrite $::rewriteText
+        setActiveArea 2
+    } err]} {
+        set ::rewriteState error; paneRewriteStatus "Parse error: $err"
+    }
+    signalTestDone
+    styleDone
+}
+
+proc signalTestDone {} { if {$::SELF_TEST} { set ::testDone 1 } }
+
+# Unattended: once the (blocking) style pass returns, deliver.
+proc styleDone {} {
+    if {$::WINDOW || $::SELF_TEST} return
+    deliver_now [expr {$::rewriteState eq "done" ? $::rewriteText : $::sourceText}]
+}
+
+#==============================================================================
+# DELIVERY
+#==============================================================================
+
+proc set_clipboard {txt} { exec wl-copy -- $txt }
+proc active_text {} { return [expr {$::activeArea == 2 ? $::rewriteText : $::sourceText}] }
+
+# dotool actions to type TEXT, two-rate cadence + IBus Ctrl+Shift+U for
+# non-ASCII (curly quotes, accented proper nouns). From the companion tool.
+proc build_inject_actions {text} {
+    set text [string trim $text]
+    set out {}
+    set first 1
+    foreach line [split $text \n] {
+        if {!$first} { lappend out "key enter" }
+        set first 0
+        if {$line eq ""} continue
+        set buf ""; set buf_is_sp 0
+        set llen [string length $line]
+        for {set i 0} {$i < $llen} {incr i} {
+            set ch [string index $line $i]
+            scan $ch %c cp
+            if {$cp > 127} {
+                _emit_run out $buf; set buf ""
+                lappend out "typedelay $::KEY_DELAY"
+                lappend out "key ctrl+shift+u"
+                lappend out [format "type %04x" $cp]
+                lappend out "key space"
+                continue
+            }
+            set ch_is_sp [string is space -strict $ch]
+            if {$buf eq "" || $ch_is_sp == $buf_is_sp} {
+                append buf $ch; set buf_is_sp $ch_is_sp
+            } else {
+                _emit_run out $buf; set buf $ch; set buf_is_sp $ch_is_sp
+            }
+        }
+        _emit_run out $buf
+    }
+    return [join $out \n]
+}
+proc _emit_run {out_var buf} {
+    upvar 1 $out_var out
+    if {$buf eq ""} return
+    set is_sp [string is space -strict [string index $buf 0]]
+    lappend out "typedelay [expr {$is_sp ? $::WORD_DELAY : $::KEY_DELAY}]"
+    lappend out "type $buf"
+}
+
+proc inject_text {text} {
+    set actions [build_inject_actions $text]
+    if {$actions eq ""} { finish 0; return }
+    enter_state typing
+    if {[catch {set ::dotool_pid [exec dotool << $actions &]} err]} {
+        puts stderr "scribe: dotool failed: $err"; finish 1; return
+    }
+    poll_dotool
+}
+proc poll_dotool {} {
+    if {$::dotool_pid == 0} return
+    if {[catch {exec kill -0 $::dotool_pid}]} { set ::dotool_pid 0; finish 0 } \
+    else { set ::dotool_id [after 150 poll_dotool] }
+}
+
+proc deliver_now {text {withEnter 0}} {
+    cancel_pending
+    switch -- $::DELIVER {
+        clipboard { set_clipboard $text; finish 0 }
+        type      { catch {wm withdraw .}; after 150 [list inject_text $text] }
+        paste     { set_clipboard $text; catch {wm withdraw .}; after 200 [list do_paste_exec $withEnter] }
+    }
+}
+proc do_paste_exec {withEnter} {
+    if {[catch {exec dotool << $::PASTE_KEY} err]} { puts stderr "scribe: dotool paste failed: $err"; finish 1; return }
+    if {$withEnter} { after $::PASTE_ENTER_GAP_MS do_paste_enter } else { finish 0 }
+}
+proc do_paste_enter {} { catch {exec dotool << $::ENTER_KEY}; finish 0 }
+
+proc cancel_pending {} {
+    if {$::autosend_id ne ""} { after cancel $::autosend_id; set ::autosend_id "" }
+    if {$::httpToken ne ""}   { catch {http::reset $::httpToken}; set ::httpToken "" }
+}
+proc finish {code} {
+    catch {after cancel $::autosend_id}
+    catch {tk systray destroy}
+    if {$::tmpfile ne "" && $::TEST_FILE eq ""} { catch {file delete $::tmpfile} }
+    after 0 [list exit $code]
+}
+
+#==============================================================================
+# REVIEW WINDOW
+#==============================================================================
+
+set ::HL_COLOR "#cfe8ff"
+set ::PANE_BG  "#ffffff"
+
+proc build_review_ui {} {
+    wm title . "Scribe"
+    set srcLabel [expr {$::INPUT eq "clipboard" ? "Clipboard" : "Dictated"}]
+
+    pack [ttk::frame .pane1 -padding 6] -fill both -expand 1
+    pack [ttk::label .pane1.lbl -text $srcLabel] -anchor w
+    text .pane1.txt -height 8 -width 80 -wrap word -relief solid -borderwidth 2 -takefocus 0
+    pack .pane1.txt -fill both -expand 1
+    bind .pane1.txt <Button-1> {setActiveArea 1; focus .; break}
+
+    pack [ttk::frame .pane2 -padding 6] -fill both -expand 1
+    pack [ttk::label .pane2.lbl -text "Styled ($::STYLE_NAME)"] -anchor w
+    text .pane2.txt -height 8 -width 80 -wrap word -relief solid -borderwidth 2 -takefocus 0
+    pack .pane2.txt -fill both -expand 1
+    bind .pane2.txt <Button-1> {setActiveArea 2; focus .; break}
+
+    set primary [expr {$::DELIVER eq "type" ? "Type" : ($::DELIVER eq "clipboard" ? "Copy" : "Paste")}]
+    pack [ttk::frame .btns -padding 6] -fill x
+    ttk::button .btns.go -text "$primary  (Space; Enter = + ↵)" -command {deliver_now [active_text] 0} -takefocus 0
+    pack .btns.go -side left -padx 4
+    if {$::STYLE_ON} {
+        ttk::button .btns.style -text "Style" -command {run_rewrite} -takefocus 0
+        pack .btns.style -side left -padx 4
+    }
+    ttk::button .btns.copy -text "Copy to clipboard" -command {set_clipboard [active_text]; finish 0} -takefocus 0
+    pack .btns.copy -side left -padx 4
+
+    .pane1.txt insert 1.0 $::sourceText
+    .pane1.txt configure -state disabled
+    if {!$::STYLE_ON} { paneRewriteStatus "(no style pass — pass --style to enable)" }
+    .pane2.txt configure -state disabled
+
+    bind . <space>  {deliver_now [active_text] 0; break}
+    bind . <Return> {deliver_now [active_text] 1; break}
+    bind . <Up>     {setActiveArea 1; break}
+    bind . <Down>   {setActiveArea 2; break}
+    wm protocol . WM_DELETE_WINDOW {set_clipboard [active_text]; finish 0}
+    refresh_highlight
+}
+proc paneSetRewrite {txt} {
+    if {![winfo exists .pane2.txt]} return
+    .pane2.txt configure -state normal; .pane2.txt delete 1.0 end
+    .pane2.txt insert 1.0 $txt; .pane2.txt configure -state disabled
+}
+proc paneRewriteStatus {msg} { paneSetRewrite $msg }
+proc setActiveArea {n} { set ::activeArea $n; refresh_highlight }
+proc refresh_highlight {} {
+    if {![winfo exists .pane1.txt]} return
+    .pane1.txt configure -background [expr {$::activeArea == 1 ? $::HL_COLOR : $::PANE_BG}]
+    .pane2.txt configure -background [expr {$::activeArea == 2 ? $::HL_COLOR : $::PANE_BG}]
+}
+
+#==============================================================================
+# DISPATCH
+#==============================================================================
+
+proc on_source_ready {text} {
+    set ::sourceText [normalize_text [string trim $text]]
+    set ::activeArea 1
+    catch {tk systray destroy}
+    if {$::WINDOW} {
+        build_review_ui
+        wm deiconify .; raise .; focus -force .
+        after 120 {catch {focus -force .}}
+        if {$::STYLE_ON && $::STYLE_AUTO ne ""} { set ::autosend_id [after $::STYLE_AUTO run_rewrite] }
+    } else {
+        if {$::STYLE_ON} { run_rewrite } else { deliver_now $::sourceText }
+    }
+}
+
+#==============================================================================
+# TRAY ICON
+#==============================================================================
+
+set ::ICON_SCALE [expr {[::tk::ScalingPct] / 100.0}]
+set ::_probe [image create photo -format [list svg -scale $::ICON_SCALE] \
+    -data {<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><circle cx="16" cy="16" r="15" fill="#000"/></svg>}]
+set ::ICON_SIZE [image width $::_probe]
+image delete $::_probe
+set ::TWOPI [expr {2.0 * acos(-1.0)}]
+set ::icon_image [image create photo -width $::ICON_SIZE -height $::ICON_SIZE]
+set ::BLINK_MS 1000
+set ::TYPE_BLINK_MS 250
+set ::blink 1
+set ::anim_id ""
+set ::TRANSPARENT_SVG {<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"></svg>}
+
+# Recording glyph: lit = red countdown disc, unlit = transparent (blink to
+# background). First frame is lit, so the icon shows red first.
+proc pie_svg {frac lit} {
+    if {!$lit} { return $::TRANSPARENT_SVG }
+    set cx 16.0; set cy 16.0; set r 15.5
+    set s "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"32\" height=\"32\">"
+    append s "<circle cx=\"$cx\" cy=\"$cy\" r=\"$r\" fill=\"#444444\"/>"
+    if {$frac >= 0.999} {
+        append s "<circle cx=\"$cx\" cy=\"$cy\" r=\"$r\" fill=\"#dd3333\"/>"
+    } elseif {$frac > 0.001} {
+        set a [expr {$frac * $::TWOPI}]
+        set ex [expr {$cx + $r * sin($a)}]; set ey [expr {$cy - $r * cos($a)}]
+        set large [expr {$frac > 0.5 ? 1 : 0}]
+        append s "<path d=\"M$cx,$cy L$cx,[expr {$cy - $r}] A$r,$r 0 $large,1 $ex,$ey Z\" fill=\"#dd3333\"/>"
+    }
+    append s "</svg>"
+    return $s
+}
+proc busy_svg {lit} {
+    set s "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"32\" height=\"32\">"
+    append s "<circle cx=\"16\" cy=\"16\" r=\"15.5\" fill=\"#f67400\"/>"
+    if {$lit} { foreach x {8.5 16 23.5} { append s "<circle cx=\"$x\" cy=\"16\" r=\"2.4\" fill=\"#ffffff\"/>" } }
+    append s "</svg>"
+    return $s
+}
+proc type_svg {lit} {
+    set l [expr {$lit ? "#ffd400" : "#3a3a3a"}]; set r [expr {$lit ? "#3a3a3a" : "#ffd400"}]
+    set s "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"32\" height=\"32\">"
+    append s "<rect x=\"3\"  y=\"8\" width=\"11\" height=\"16\" rx=\"2\" fill=\"$l\"/>"
+    append s "<rect x=\"18\" y=\"8\" width=\"11\" height=\"16\" rx=\"2\" fill=\"$r\"/>"
+    append s "</svg>"
+    return $s
+}
+proc draw_icon {frac state lit} {
+    switch -- $state {
+        styling - transcribing { set svg [busy_svg $lit] }
+        typing                 { set svg [type_svg $lit] }
+        default                { set svg [pie_svg $frac $lit] }
+    }
+    set tmp [image create photo -data $svg -format [list svg -scale $::ICON_SCALE]]
+    $::icon_image copy $tmp -compositingrule set
+    image delete $tmp
+}
+proc recording_frac {} {
+    set max_s [expr {double($::TIMEOUT_S)}]
+    set rem [expr {max(0.0, $max_s - ([clock milliseconds] - $::start_ms) / 1000.0)}]
+    return [expr {$rem / $max_s}]
+}
+proc animate {} {
+    set ms $::BLINK_MS
+    switch -- $::state {
+        recording    { draw_icon [recording_frac] recording $::blink }
+        transcribing { draw_icon 1.0 transcribing $::blink }
+        styling      { draw_icon 1.0 styling $::blink }
+        typing       { draw_icon 1.0 typing $::blink; set ms $::TYPE_BLINK_MS }
+        default      { set ::anim_id ""; return }
+    }
+    set ::blink [expr {!$::blink}]
+    set ::anim_id [after $ms animate]
+}
+proc start_animate {} { if {$::anim_id eq ""} animate }
+proc stop_animate {}  { if {$::anim_id ne ""} { after cancel $::anim_id; set ::anim_id "" } }
+proc enter_state {newstate} { stop_animate; set ::state $newstate; set ::blink 1; start_animate }
+
+#==============================================================================
+# MIC INPUT
+#==============================================================================
+
+proc resolve_source {capture} {
+    if {![string is integer -strict $capture]} { return $capture }
+    set sources {}
+    foreach line [split [exec pactl list sources short] \n] {
+        set name [lindex $line 1]
+        if {$name ne "" && ![string match *.monitor $name]} { lappend sources $name }
+    }
+    set idx [expr {int($capture)}]
+    if {$idx < [llength $sources]} { return [lindex $sources $idx] }
+    return ""
+}
+proc sweep_stale_recordings {} {
+    foreach f [glob -nocomplain -directory $::CACHE_DIR "scribe-*.wav"] {
+        if {![regexp {scribe-(\d+)\.wav$} [file tail $f] -> opid]} continue
+        if {$opid eq [pid]} continue
+        if {[catch {exec kill -0 $opid}]} { catch {file delete -- $f} }
+    }
+}
+proc save_log {text} {
+    if {$::log_stem eq ""} return
+    if {[catch {file mkdir $::LOG_DIR}]} return
+    catch {
+        if {[file exists $::tmpfile]} { file copy -force -- $::tmpfile [file join $::LOG_DIR "$::log_stem.wav"] }
+        set fh [open [file join $::LOG_DIR "$::log_stem.txt"] w]; puts -nonewline $fh $text; close $fh
+    }
+}
+proc transcribe {} {
+    if {$::done} return
+    set ::done 1
+    set wcmd [list whisper-cli -m $::MODEL -f $::tmpfile -nt -l $::LANG -t $::THREADS]
+    if {$::PROMPT ne ""}   { lappend wcmd --prompt $::PROMPT }
+    if {$::NO_FALLBACK}    { lappend wcmd --no-fallback }
+    if {$::NO_GPU}         { lappend wcmd --no-gpu }
+    if {$::FLASH_ATTN}     { lappend wcmd --flash-attn }
+    if {$::NO_FLASH_ATTN}  { lappend wcmd --no-flash-attn }
+    if {$::PRINT_SPECIAL}  { lappend wcmd --print-special }
+    if {[catch {set ::wchan [open "|$wcmd 2>/dev/null" r]} err]} {
+        puts stderr "scribe: whisper-cli failed: $err"; finish 1; return
+    }
+    set ::wbuf ""
+    fconfigure $::wchan -blocking 0
+    fileevent $::wchan readable transcribe_collect
+}
+proc transcribe_collect {} {
+    append ::wbuf [read $::wchan]
+    if {![eof $::wchan]} return
+    fileevent $::wchan readable {}
+    if {[catch {close $::wchan} cerr]} { puts stderr "scribe: whisper-cli failed: $cerr"; finish 1; return }
+    stop_animate
+    catch {save_log $::wbuf}
+    on_source_ready $::wbuf
+}
+proc poll_parecord {} {
+    if {$::parecord_pid == 0} return
+    if {[catch {exec kill -0 $::parecord_pid}]} { set ::parecord_pid 0; transcribe } \
+    else { set ::poll_id [after 200 poll_parecord] }
+}
+proc start_recording {} {
+    file mkdir $::CACHE_DIR
+    sweep_stale_recordings
+    set ::tmpfile [file join $::CACHE_DIR "scribe-[pid].wav"]
+    set ::log_stem "[clock format [clock seconds] -format {%Y-%m-%dT%H-%M-%S}]-[pid]"
+    set ::start_ms [clock milliseconds]
+    set source ""
+    if {$::CAPTURE ne ""} { set source [resolve_source $::CAPTURE] }
+    set pcmd [list parecord --channels=1 --rate=16000 --format=s16ne --file-format=wav]
+    if {$source ne ""} { lappend pcmd "--device=$source" }
+    lappend pcmd $::tmpfile
+    if {[catch {set ::parecord_pid [exec {*}$pcmd &]} err]} {
+        puts stderr "scribe: failed to start parecord: $err"; finish 1; return
+    }
+    set ::poll_id [after 200 poll_parecord]
+    set ::auto_stop_id [after [expr {$::TIMEOUT_S * 1000}] stop_recording]
+}
+
+#==============================================================================
+# SECOND-PRESS SOCKET (mic): stop / status / pause / resume
+#==============================================================================
+
+proc probe_running {cmd} {
+    if {[catch {socket 127.0.0.1 $::PORT} sock]} { return }
+    fconfigure $sock -buffering line -translation lf
+    gets $sock _banner; puts $sock $cmd
+    set reply ""
+    while {[gets $sock line] >= 0} {
+        if {[string match "OK*" $line] || [string match "ACK*" $line]} { set reply $line; break }
+    }
+    close $sock
+    if {[string match "OK*" $reply]} { exit 0 }
+    exit 1
+}
+proc serve_listener {} {
+    if {[catch {socket -server handle_client -myaddr 127.0.0.1 $::PORT} sock]} {
+        puts stderr "scribe: cannot bind 127.0.0.1:$::PORT: $sock"; return
+    }
+    set ::listener $sock
+}
+proc stop_listener {} { if {[info exists ::listener]} { catch {close $::listener}; unset ::listener } }
+proc handle_client {sock _addr _port} {
+    fconfigure $sock -buffering line -translation lf
+    puts $sock "OK scribe 1"
+    if {[gets $sock cmd] < 0} { close $sock; return }
+    switch -- [string trim $cmd] {
+        stop  { puts $sock "OK"; after idle stop_recording }
+        pause {
+            if {$::state eq "paused"} { puts $sock "ACK already-paused" } \
+            elseif {$::parecord_pid > 0 && ![catch {exec kill -STOP $::parecord_pid}]} {
+                set ::state paused; stop_animate; draw_icon [recording_frac] recording 1; puts $sock "OK"
+            } else { puts $sock "ACK pause-failed" }
+        }
+        resume {
+            if {$::state ne "paused"} { puts $sock "ACK not-paused" } \
+            elseif {$::parecord_pid > 0 && ![catch {exec kill -CONT $::parecord_pid}]} {
+                enter_state recording; puts $sock "OK"
+            } else { puts $sock "ACK resume-failed" }
+        }
+        status { puts $sock "state $::state"; puts $sock "OK" }
+        default { puts $sock "ACK unknown-command" }
+    }
+    close $sock
+}
+proc stop_recording {} {
+    stop_listener
+    if {$::auto_stop_id ne ""} { after cancel $::auto_stop_id; set ::auto_stop_id "" }
+    if {$::parecord_pid > 0} {
+        if {$::state eq "paused"} { catch {exec kill -CONT $::parecord_pid} }
+        catch {exec kill $::parecord_pid}
+    }
+    if {$::state ne "transcribing"} { enter_state transcribing }
+}
+
+#==============================================================================
+# CLIPBOARD INPUT
+#==============================================================================
+
+proc read_clipboard {} {
+    if {[catch {clipboard get -type UTF8_STRING} content]} {
+        if {[catch {clipboard get} content]} { return "" }
+    }
+    return [string trim $content]
+}
+proc acquire_clipboard {} {
+    set txt [read_clipboard]
+    if {$txt eq ""} { after 300 acquire_clipboard; return }
+    on_source_ready $txt
+}
+
+#==============================================================================
+# SELF-TEST
+#==============================================================================
+
+proc check {label cond {detail ""}} {
+    upvar 1 fail fail
+    if {[uplevel 1 [list expr $cond]]} { puts "PASS: $label" } \
+    else { puts "FAIL: $label $detail"; set fail 1 }
+}
+proc run_self_test {} {
+    set fail 0
+    loadDialect
+
+    set ::DIALECT off
+    set ::QSTYLE double
+    check "double apostrophe" {[normalize_text "I'm"] eq "I’m"}
+    check "double quotation pair" {[normalize_text "say \"hi\""] eq "say “hi”"}
+    set ::QSTYLE single
+    check "single quotation pair" {[normalize_text "say \"hi\""] eq "say ‘hi’"}
+    check "single apostrophe still ’" {[normalize_text "I'm"] eq "I’m"}
+    set ::QSTYLE straight
+    check "straight leaves ASCII" {[normalize_text "I'm \"x\""] eq "I'm \"x\""}
+    set ::QSTYLE double
+
+    set ::DIALECT british
+    check "ize->ise" {[britishize "I realize this"] eq "I realise this"}
+    check "ization->isation" {[britishize "organization"] eq "organisation"}
+    check "ize exception size" {[britishize "the size"] eq "the size"}
+    check "case preserved" {[britishize "Realize"] eq "Realise"}
+    if {[dict size $::ukmap] > 0} { check "dictionary colour" {[britishize "color"] eq "colour"} }
+    set ::DIALECT off
+
+    set acts [build_inject_actions "ab cd"]
+    check "inject types words" {[string match "*type ab*" $acts] && [string match "*type cd*" $acts]}
+    check "inject ibus for curly" {[string match "*ctrl+shift+u*" [build_inject_actions "x’y"]]}
+
+    check "paste key" {$::PASTE_KEY eq "key ctrl+v"}
+    check "enter key" {$::ENTER_KEY eq "key enter"}
+
+    set ::sourceText "src"; set ::rewriteText "rw"; setActiveArea 1
+    check "active=source pane1" {[active_text] eq "src"}
+    setActiveArea 2
+    check "active=rewrite pane2" {[active_text] eq "rw"}
+
+    set ::WINDOW 1; set ::SELF_TEST 1; set ::QSTYLE double
+    set ::sourceText "so the meeting moves to friday because the client called"
+    set ::rewriteState idle; set ::testDone 0
+    run_rewrite
+    set aid [after 65000 {set ::testDone timeout}]
+    vwait ::testDone
+    after cancel $aid
+    check "style pass returned" {$::rewriteState eq "done" && [string length $::rewriteText] > 0} "(state=$::rewriteState)"
+    puts "    STYLED: $::rewriteText"
+
+    set ::DELIVER clipboard
+    if {![catch {set_clipboard "round-trip-probe"}]} {
+        set back ""; catch {set back [exec wl-paste -n]}
+        check "clipboard round-trip" {$back eq "round-trip-probe"}
+    }
+
+    set ::STYLE_ON 1; set ::INPUT mic; set ::STYLE_NAME "clear"; set ::DELIVER paste
+    if {![catch {build_review_ui} e]} {
+        check "review UI builds" {[winfo exists .pane1.txt] && [winfo exists .btns.go] && [winfo exists .btns.style]}
+    } else { check "review UI builds" 0 "($e)" }
+
+    puts [expr {$fail ? "SELF-TEST: FAIL" : "SELF-TEST: PASS"}]
+    exit $fail
+}
+
+#==============================================================================
+# MAIN
+#==============================================================================
+
+wm withdraw .
+
+if {$::INPUT ni {mic clipboard ""}} { fatal "--input must be mic or clipboard" }
+if {$::DELIVER ni {type paste clipboard}} { fatal "--deliver must be type, paste, or clipboard" }
+if {$::QUOTES ni {"" double single straight}} { fatal "--quotes must be double, single, or straight" }
+if {$::DIALECT ni {off british}} { fatal "--dialect must be off or british" }
+if {$::STYLE_AUTO ne "" && ![string is integer -strict $::STYLE_AUTO]} { fatal "--auto-style-delay must be an integer (ms)" }
+if {!$::WINDOW && $::INPUT eq ""} { fatal "--no-window requires --input mic|clipboard" }
+if {$::INPUT eq ""} { set ::INPUT mic }
+
+# Resolve quote style: explicit --quotes wins; else british -> single; else double.
+if {$::QUOTES ne ""} {
+    set ::QSTYLE $::QUOTES
+} else {
+    set ::QSTYLE [expr {$::DIALECT eq "british" ? "single" : "double"}]
+}
+
+loadDeepSeekConfig
+loadSystemPrompts
+loadDialect
+if {$::STYLE_ON} { loadStyle }
+
+if {$::SELF_TEST} { after idle run_self_test; vwait forever }
+if {$::TEST_TEXT ne ""} { after idle [list on_source_ready $::TEST_TEXT]; vwait forever }
+if {$::TEST_FILE ne ""} {
+    if {![file readable $::TEST_FILE]} { fatal "--test-file not readable: $::TEST_FILE" }
+    set ::tmpfile $::TEST_FILE
+    after idle transcribe
+    vwait forever
+}
+
+if {$::INPUT eq "clipboard"} { after idle acquire_clipboard; vwait forever }
+
+# Mic. A second press reaches the running recorder over the socket.
+probe_running $::CMD
+serve_listener
+start_recording
+draw_icon 1.0 recording 1
+tk systray create -image $::icon_image -text $::APPNAME -button1 stop_recording
+enter_state recording
+vwait forever

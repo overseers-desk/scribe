@@ -250,6 +250,14 @@ proc smarten_quotes {text style} {
     return $out
 }
 
+# Dialect supports off|british only — there is deliberately no "us" target.
+# Converting *to* US English is not the mirror of converting to British: a
+# blanket -ise->-ize rule corrupts the many English words that end in -ise but
+# are not the -ize suffix (praise->praize, cruise->cruize, noise->noize,
+# advertise->advertize, exercise->exercize). A safe ->US pass would need a full
+# explicit dictionary of the real -ize verbs, which is not worth carrying. "off"
+# already leaves whisper's output untouched, so omit -ise normalisation rather
+# than do it wrongly.
 proc loadDialect {} {
     set ::ukmap [dict create]
     if {![file exists $::DIALECT_FILE]} { return }
@@ -470,10 +478,23 @@ proc poll_dotool {} {
 
 proc deliver_now {text {withEnter 0}} {
     cancel_pending
+    # In window mode, hide the review window first so focus returns to the prior
+    # window before we type/paste. In no-window mode there is no window to hide;
+    # calling `wm withdraw .` on this Tk build maps-then-unmaps the toplevel (a
+    # visible flash) and steals focus, so the paste would race focus return and
+    # land the prior clipboard. Skip the window poke entirely, as the windowless
+    # typing path always has.
     switch -- $::DELIVER {
         clipboard { set_clipboard $text; finish 0 }
-        type      { catch {wm withdraw .}; after 150 [list inject_text $text] }
-        paste     { set_clipboard $text; catch {wm withdraw .}; after 200 [list do_paste_exec $withEnter] }
+        type {
+            if {$::WINDOW} { catch {wm withdraw .}; after 150 [list inject_text $text] } \
+            else { inject_text $text }
+        }
+        paste {
+            set_clipboard $text
+            if {$::WINDOW} { catch {wm withdraw .}; after 200 [list do_paste_exec $withEnter] } \
+            else { after 50 [list do_paste_exec $withEnter] }
+        }
     }
 }
 proc do_paste_exec {withEnter} {

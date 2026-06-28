@@ -34,6 +34,7 @@ set ::DIALECT_FILE     [file join $::APP_DIR "dialect-us-to-british.tsv"]
 set ::LOG_DIR          /var/local/log/dictation
 set ::CACHE_DIR        [file join [expr {[info exists ::env(XDG_CACHE_HOME)] && $::env(XDG_CACHE_HOME) ne "" ? $::env(XDG_CACHE_HOME) : "$::env(HOME)/.cache"}] scribe]
 
+set ::VERSION          0.6
 set ::PORT             4212
 set ::APPNAME          "scribe-[pid]"
 
@@ -154,6 +155,7 @@ for {set i 0} {$i < [llength $::argv]} {incr i} {
             set ::CMD [lindex $::argv [incr i]]
             if {$::CMD ni {stop status pause resume}} { fatal "--cmd must be stop|status|pause|resume" }
         }
+        -v - --version { puts "scribe $::VERSION"; exit 0 }
         -h - --help {
             puts "Usage: scribe \[options\]"
             puts "  --input mic|clipboard          source (required with --no-window)"

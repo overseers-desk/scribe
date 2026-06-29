@@ -109,7 +109,7 @@ set ::rewriteState  idle
 # ARGUMENT PARSING
 #==============================================================================
 
-proc fatal {msg} { puts stderr "scribe: $msg"; exit 1 }
+proc fatal {msg} { catch {exec logger -t scribe -p user.err -- $msg}; puts stderr "scribe: $msg"; exit 1 }
 
 set prompt_seen 0
 for {set i 0} {$i < [llength $::argv]} {incr i} {
@@ -166,7 +166,8 @@ for {set i 0} {$i < [llength $::argv]} {incr i} {
             puts "  --quotes double|single|straight   double: “ ” · single: ‘ ’ · straight: ASCII"
             puts "  --dialect off|british          british: US→UK spelling; default quotes -> single"
             puts "  mic: -m -l -t -to -c --prompt|--prompt-file --key-delay --word-delay -nf -ng -fa -ps"
-            puts "  --cmd stop|status|pause|resume  --debug --self-test --test-text S --test-file WAV"
+            puts "  --cmd stop|status|pause|resume  --self-test --test-text S --test-file WAV"
+            puts "  --debug                        keep the recording; write a replay .sh of the whisper-cli call"
             exit 0
         }
         default { fatal "unknown argument: $arg" }
@@ -174,6 +175,25 @@ for {set i 0} {$i < [llength $::argv]} {incr i} {
 }
 
 proc dbg {msg} { if {$::debug_mode} { puts stderr "scribe \[debug\]: $msg" } }
+
+# Log to the systemd journal under a stable tag and syslog priority, so errors
+# are visible in normal mode with: journalctl -t scribe (e.g. -p err). Ubuntu's
+# scope-launched apps already capture stderr, but untagged; logger gives the tag
+# and level. Also echo to stderr for terminal runs. level: err|warning|notice|info.
+proc logsys {level msg} {
+    catch {exec logger -t scribe -p user.$level -- $msg}
+    puts stderr "scribe: $msg"
+}
+
+# Last of whisper-cli's captured stderr, trimmed, for a failure log line.
+proc whisper_stderr {} {
+    if {![info exists ::werrfile] || ![file exists $::werrfile]} { return "" }
+    set txt ""
+    catch { set fh [open $::werrfile r]; set txt [read $fh]; close $fh }
+    set txt [string trim $txt]
+    if {[string length $txt] > 2000} { set txt "…[string range $txt end-1999 end]" }
+    return $txt
+}
 
 #==============================================================================
 # CONFIG LOADING
@@ -468,7 +488,7 @@ proc inject_text {text} {
     if {$actions eq ""} { finish 0; return }
     enter_state typing
     if {[catch {set ::dotool_pid [exec dotool << $actions &]} err]} {
-        puts stderr "scribe: dotool failed: $err"; finish 1; return
+        logsys err "dotool failed: $err"; finish 1; return
     }
     poll_dotool
 }
@@ -500,7 +520,7 @@ proc deliver_now {text {withEnter 0}} {
     }
 }
 proc do_paste_exec {withEnter} {
-    if {[catch {exec dotool << $::PASTE_KEY} err]} { puts stderr "scribe: dotool paste failed: $err"; finish 1; return }
+    if {[catch {exec dotool << $::PASTE_KEY} err]} { logsys err "dotool paste failed: $err"; finish 1; return }
     if {$withEnter} { after $::PASTE_ENTER_GAP_MS do_paste_enter } else { finish 0 }
 }
 proc do_paste_enter {} { catch {exec dotool << $::ENTER_KEY}; finish 0 }
@@ -512,7 +532,7 @@ proc cancel_pending {} {
 proc finish {code} {
     catch {after cancel $::autosend_id}
     catch {tk systray destroy}
-    if {$::tmpfile ne "" && $::TEST_FILE eq ""} { catch {file delete $::tmpfile} }
+    if {$::tmpfile ne "" && $::TEST_FILE eq "" && !$::debug_mode} { catch {file delete $::tmpfile} }
     after 0 [list exit $code]
 }
 
@@ -704,6 +724,38 @@ proc save_log {text} {
         set fh [open [file join $::LOG_DIR "$::log_stem.txt"] w]; puts -nonewline $fh $text; close $fh
     }
 }
+# Shell-quote a Tcl list into a copy-pasteable command line.
+proc shell_quote {words} {
+    set out {}
+    foreach w $words {
+        if {$w eq "" || [regexp {[^A-Za-z0-9_./:=-]} $w]} {
+            set w [string map [list ' "'\\''"] $w]
+            lappend out '$w'
+        } else {
+            lappend out $w
+        }
+    }
+    return [join $out " "]
+}
+
+# --debug capture. scribe runs whisper-cli with stderr discarded; this writes a
+# runnable copy of the exact call (stderr intact) beside the kept recording, so
+# the transcription can be replayed by hand to see timings or a GPU crash.
+proc save_debug_command {wcmd} {
+    set cmdfile [file rootname $::tmpfile].sh
+    if {[catch {
+        set fh [open $cmdfile w]
+        puts $fh "#!/bin/sh"
+        puts $fh "# scribe --debug replay of the whisper-cli call on [file tail $::tmpfile]."
+        puts $fh "# scribe itself runs this with 2>/dev/null; kept here so you see timings/errors."
+        puts $fh [shell_quote $wcmd]
+        close $fh
+        file attributes $cmdfile -permissions 0755
+    } err]} { dbg "could not write $cmdfile: $err"; return }
+    dbg "replay script: $cmdfile"
+    dbg "audio kept:    $::tmpfile"
+}
+
 proc transcribe {} {
     if {$::done} return
     set ::done 1
@@ -714,8 +766,13 @@ proc transcribe {} {
     if {$::FLASH_ATTN}     { lappend wcmd --flash-attn }
     if {$::NO_FLASH_ATTN}  { lappend wcmd --no-flash-attn }
     if {$::PRINT_SPECIAL}  { lappend wcmd --print-special }
-    if {[catch {set ::wchan [open "|$wcmd 2>/dev/null" r]} err]} {
-        puts stderr "scribe: whisper-cli failed: $err"; finish 1; return
+    if {$::debug_mode}     { save_debug_command $wcmd }
+    # Capture whisper's stderr to a file rather than discarding it, so a failure
+    # (or a GPU/driver fault) is logged. Keeping it off the read pipe avoids
+    # mixing diagnostics into the transcript.
+    set ::werrfile [file join $::CACHE_DIR "scribe-[pid].stderr"]
+    if {[catch {set ::wchan [open "|$wcmd 2>$::werrfile" r]} err]} {
+        logsys err "whisper-cli failed to start: $err"; finish 1; return
     }
     set ::wbuf ""
     fconfigure $::wchan -blocking 0
@@ -725,7 +782,13 @@ proc transcribe_collect {} {
     append ::wbuf [read $::wchan]
     if {![eof $::wchan]} return
     fileevent $::wchan readable {}
-    if {[catch {close $::wchan} cerr]} { puts stderr "scribe: whisper-cli failed: $cerr"; finish 1; return }
+    if {[catch {close $::wchan} cerr]} {
+        set tail [whisper_stderr]
+        logsys err "whisper-cli failed: $cerr[expr {$tail ne "" ? ": $tail" : ""}]"
+        if {!$::debug_mode} { catch {file delete $::werrfile} }
+        finish 1; return
+    }
+    if {!$::debug_mode} { catch {file delete $::werrfile} }
     stop_animate
     catch {save_log $::wbuf}
     on_source_ready $::wbuf
@@ -738,8 +801,14 @@ proc poll_parecord {} {
 proc start_recording {} {
     file mkdir $::CACHE_DIR
     sweep_stale_recordings
-    set ::tmpfile [file join $::CACHE_DIR "scribe-[pid].wav"]
     set ::log_stem "[clock format [clock seconds] -format {%Y-%m-%dT%H-%M-%S}]-[pid]"
+    # In --debug, name the recording so sweep_stale_recordings (scribe-<pid>.wav
+    # only) never reaps it: the kept audio and its replay script survive later runs.
+    if {$::debug_mode} {
+        set ::tmpfile [file join $::CACHE_DIR "scribe-debug-$::log_stem.wav"]
+    } else {
+        set ::tmpfile [file join $::CACHE_DIR "scribe-[pid].wav"]
+    }
     set ::start_ms [clock milliseconds]
     set source ""
     if {$::CAPTURE ne ""} { set source [resolve_source $::CAPTURE] }
@@ -747,7 +816,7 @@ proc start_recording {} {
     if {$source ne ""} { lappend pcmd "--device=$source" }
     lappend pcmd $::tmpfile
     if {[catch {set ::parecord_pid [exec {*}$pcmd &]} err]} {
-        puts stderr "scribe: failed to start parecord: $err"; finish 1; return
+        logsys err "failed to start parecord: $err"; finish 1; return
     }
     set ::poll_id [after 200 poll_parecord]
     set ::auto_stop_id [after [expr {$::TIMEOUT_S * 1000}] stop_recording]
@@ -771,7 +840,7 @@ proc probe_running {cmd} {
 }
 proc serve_listener {} {
     if {[catch {socket -server handle_client -myaddr 127.0.0.1 $::PORT} sock]} {
-        puts stderr "scribe: cannot bind 127.0.0.1:$::PORT: $sock"; return
+        logsys err "cannot bind 127.0.0.1:$::PORT: $sock"; return
     }
     set ::listener $sock
 }

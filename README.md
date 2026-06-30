@@ -11,10 +11,15 @@ will happen:
 --input mic|clipboard            where the text comes from
 --window | --no-window           show a review window, or run unattended
 --deliver type|paste|clipboard   how the result leaves
---style[=NAME]                   apply a style pass (omit for raw text)
+--style[=NAME]                   apply a style pass (needs a configured AI provider)
+--provider NAME                  pick a [provider.NAME] from config.toml
 --quotes double|single|straight  quotation style (default double)
 --dialect off|british            British spelling conversion (default off)
 ```
+
+The style pass is the only feature that needs an API key. With no configuration
+and no key, scribe still runs as a dictation tool — the style pass and the styled
+review pane are simply absent.
 
 ## Dependencies
 
@@ -35,22 +40,28 @@ Other requirements:
   `yaml` must be available to that interpreter.
 - A **whisper model** file (for example `ggml-medium.en.bin`), passed with
   `--model`, for `--input mic`.
-- A **DeepSeek API key** in `deepseek.json`, for `--style`.
+- An **AI provider** in `config.toml`, only for `--style` (optional; see below).
 - `dotool` needs access to `/dev/uinput` (typically membership of the `input`
   group). For non-ASCII characters (curly quotes, accented names) the `--deliver
   type` path uses IBus Ctrl+Shift+U, so IBus (or fcitx) should be running.
 
 ## Setup
 
-1. Put your DeepSeek key in `deepseek.json`:
+1. (Optional, only for `--style`) Copy `config.example.toml` to
+   `~/.config/scribe/config.toml` and fill in a provider:
 
-   ```json
-   {
-     "api_key": "sk-your-key-here",
-     "api_base": "https://api.deepseek.com",
-     "model": "deepseek-chat"
-   }
+   ```toml
+   default_provider = "deepseek"
+
+   [provider.deepseek]
+   api_key  = "sk-your-key-here"
+   model    = "deepseek-chat"
+   api_base = "https://api.deepseek.com"
    ```
+
+   Add more `[provider.NAME]` tables (e.g. `claude`, `chatgpt`) and pick one with
+   `--provider NAME` or `default_provider`. Skip this entirely to run dictation
+   only. A legacy single-provider `deepseek.json` is still honoured if present.
 
 2. Make the script executable: `chmod +x scribe.tcl`.
 
@@ -87,6 +98,8 @@ sends a return, and a second button copies to the clipboard without pasting.
 
 ## Configuration files
 
+- `config.toml` (`~/.config/scribe/`): AI providers for the style pass. Optional;
+  `[provider.NAME]` tables plus `default_provider`. See `config.example.toml`.
 - `styles/*.txt`: style guides, one per file; the name is the `--style` value.
 - `current-mode.conf`: the last-used style name, used when `--style` has no name.
 - `system-prompts.yaml`: the wrapper text around the style guide and user text.

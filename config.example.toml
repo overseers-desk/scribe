@@ -1,0 +1,29 @@
+# scribe configuration. Copy to ~/.config/scribe/config.toml (or the repo root
+# for development) and fill in a provider. One file holds every provider.
+#
+# This file is entirely optional. With no config and no api_key, scribe runs as
+# a dictation tool — the AI style pass and the styled review pane are simply
+# absent. The style pass is the only feature that needs a provider.
+
+# Which [provider.NAME] the style pass uses by default. Override per-run with
+# --provider NAME. If exactly one provider is defined, it is used even without
+# this line.
+default_provider = "deepseek"
+
+# Any OpenAI-compatible chat-completions endpoint works; set api_base per
+# provider. A section with no api_key is treated as not configured.
+
+[provider.deepseek]
+api_key  = "sk-..."
+model    = "deepseek-chat"
+api_base = "https://api.deepseek.com"
+
+[provider.claude]
+api_key  = "sk-ant-..."
+model    = "claude-opus-4-8"
+api_base = "https://api.anthropic.com"
+
+[provider.chatgpt]
+api_key  = "sk-..."
+model    = "gpt-4o"
+api_base = "https://api.openai.com/v1"

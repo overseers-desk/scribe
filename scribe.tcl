@@ -20,6 +20,12 @@ package require Tk 9
 # LD_LIBRARY_PATH set, the way the companion dictation tool is bound.
 #
 # Requires: dotool, whisper-cli, parecord (PulseAudio), wl-copy (wl-clipboard).
+#
+# The style pass is optional. AI providers are configured in config.toml
+# (~/.config/scribe/config.toml): a [provider.NAME] table per provider plus a
+# top-level default_provider; --provider NAME overrides the default. With no
+# config and no keys, scribe still runs as a dictation tool — the style pass and
+# the styled review pane are simply absent (see CLAUDE.md).
 
 #==============================================================================
 # CONFIGURATION
@@ -76,7 +82,9 @@ set ::TEST_TEXT        ""
 set ::TEST_FILE        ""
 set ::SELF_TEST        0
 
-# --- DeepSeek ---
+# --- AI provider (resolved from config.toml; optional) ---
+set ::PROVIDER     ""        ;# CLI override of which [provider.NAME] to use
+set ::AI_AVAILABLE 0         ;# 1 once a provider with an api_key resolves
 set ::apiKey  ""
 set ::apiBase ""
 set ::apiModel ""
@@ -123,6 +131,7 @@ for {set i 0} {$i < [llength $::argv]} {incr i} {
         --auto-style-delay { set ::STYLE_ON 1; set ::STYLE_AUTO [lindex $::argv [incr i]] }
         --quotes           { set ::QUOTES [lindex $::argv [incr i]] }
         --dialect          { set ::DIALECT [lindex $::argv [incr i]] }
+        --provider         { set ::PROVIDER [lindex $::argv [incr i]] }
         -m  - --model      { set ::MODEL     [lindex $::argv [incr i]] }
         -l  - --language   { set ::LANG      [lindex $::argv [incr i]] }
         -t  - --threads    { set ::THREADS   [lindex $::argv [incr i]] }
@@ -161,7 +170,8 @@ for {set i 0} {$i < [llength $::argv]} {incr i} {
             puts "  --input mic|clipboard          source (required with --no-window)"
             puts "  --window | --no-window         draw the review window, or run unattended"
             puts "  --deliver type|paste|clipboard how the result leaves (default paste)"
-            puts "  --style\[=NAME\]                 apply a style pass (omit = raw)"
+            puts "  --style\[=NAME\]                 apply a style pass (needs a configured AI provider)"
+            puts "  --provider NAME                use \[provider.NAME\] from config.toml (else default_provider)"
             puts "  --auto-style-delay MS          (window) auto-style after MS ms; 1 = immediate"
             puts "  --quotes double|single|straight   double: “ ” · single: ‘ ’ · straight: ASCII"
             puts "  --dialect off|british          british: US→UK spelling; default quotes -> single"
@@ -199,8 +209,80 @@ proc whisper_stderr {} {
 # CONFIG LOADING
 #==============================================================================
 
-proc loadDeepSeekConfig {} {
-    if {![file exists $::DEEPSEEK_CONFIG]} { fatal "missing deepseek.json at $::DEEPSEEK_CONFIG" }
+# Minimal TOML reader for scribe's config: [section] / [a.b] headers and
+# key = value lines, values optionally "double" or 'single' quoted (a bare value
+# has any trailing # comment stripped). Enough for provider tables plus the
+# top-level default_provider; not a general TOML parser (no arrays, inline tables,
+# or multiline strings — scribe's config needs none). Returns a dict keyed by
+# section name (top-level keys live under ""), each value a dict of key->value.
+proc parse_toml {data} {
+    set sections [dict create "" [dict create]]
+    set cur ""
+    foreach raw [split $data \n] {
+        set line [string trim $raw]
+        if {$line eq "" || [string index $line 0] eq "#"} continue
+        if {[regexp {^\[(.+)\]$} $line -> name]} {
+            set cur [string trim $name]
+            if {![dict exists $sections $cur]} { dict set sections $cur [dict create] }
+            continue
+        }
+        if {[regexp {^([^=]+?)\s*=\s*(.+)$} $line -> k v]} {
+            set v [string trim $v]
+            if {[regexp {^"([^"]*)"\s*(?:#.*)?$} $v -> inner]} { set v $inner } \
+            elseif {[regexp {^'([^']*)'\s*(?:#.*)?$} $v -> inner]} { set v $inner } \
+            else { set v [string trim [regsub {\s+#.*$} $v ""]] }
+            dict set sections $cur [string trim $k] $v
+        }
+    }
+    return $sections
+}
+
+# Candidate config paths, in order: XDG user config, then the app dir (dev).
+proc config_candidates {} {
+    set xdg [expr {[info exists ::env(XDG_CONFIG_HOME)] && $::env(XDG_CONFIG_HOME) ne "" ? $::env(XDG_CONFIG_HOME) : "$::env(HOME)/.config"}]
+    return [list [file join $xdg scribe config.toml] [file join $::APP_DIR config.toml]]
+}
+
+# Resolve an AI provider from config.toml, if one is configured. This NEVER
+# fatals: scribe must run as a dictation tool with no config and no keys (see
+# CLAUDE.md). On success sets ::AI_AVAILABLE 1 and ::apiKey/::apiBase/::apiModel;
+# otherwise leaves ::AI_AVAILABLE 0 and the style pass stays disabled.
+proc loadConfig {} {
+    set ::AI_AVAILABLE 0
+    set path ""
+    foreach c [config_candidates] { if {[file exists $c]} { set path $c; break } }
+    if {$path eq ""} { loadLegacyDeepseek; return }
+
+    if {[catch {set fh [open $path r]; set data [read $fh]; close $fh} err]} {
+        logsys warning "cannot read config $path: $err — running without AI"; return
+    }
+    set toml [parse_toml $data]
+    set providers [dict create]
+    dict for {sec kv} $toml {
+        if {[regexp {^provider\.(.+)$} $sec -> pname]} { dict set providers [string trim $pname] $kv }
+    }
+    set choice $::PROVIDER
+    if {$choice eq "" && [dict exists $toml "" default_provider]} { set choice [dict get $toml "" default_provider] }
+    if {$choice eq "" && [dict size $providers] == 1} { set choice [lindex [dict keys $providers] 0] }
+    if {$choice eq ""} { dbg "no provider selected in $path — running without AI"; return }
+    if {![dict exists $providers $choice]} {
+        logsys warning "provider '$choice' not found in $path — running without AI"; return
+    }
+    set p [dict get $providers $choice]
+    set ::apiKey   [expr {[dict exists $p api_key]  ? [dict get $p api_key]  : ""}]
+    set ::apiBase  [expr {[dict exists $p api_base] ? [dict get $p api_base] : "https://api.deepseek.com"}]
+    set ::apiModel [expr {[dict exists $p model]    ? [dict get $p model]    : "deepseek-chat"}]
+    if {$::apiKey ne ""} {
+        set ::AI_AVAILABLE 1; dbg "provider = $choice ($path)"
+    } else {
+        logsys warning "provider '$choice' has no api_key — running without AI"
+    }
+}
+
+# Backward compatibility: the pre-0.6.1 single-provider deepseek.json in the app
+# dir, used when no config.toml is present.
+proc loadLegacyDeepseek {} {
+    if {![file exists $::DEEPSEEK_CONFIG]} return
     if {[catch {
         package require json
         set f [open $::DEEPSEEK_CONFIG r]; set data [read $f]; close $f
@@ -208,8 +290,8 @@ proc loadDeepSeekConfig {} {
         set ::apiKey   [expr {[dict exists $cfg api_key]  ? [dict get $cfg api_key]  : ""}]
         set ::apiBase  [expr {[dict exists $cfg api_base] ? [dict get $cfg api_base] : "https://api.deepseek.com"}]
         set ::apiModel [expr {[dict exists $cfg model]    ? [dict get $cfg model]    : "deepseek-chat"}]
-    } err]} { fatal "error loading deepseek.json: $err" }
-    if {$::apiKey eq ""} { fatal "api_key not found in deepseek.json" }
+        if {$::apiKey ne ""} { set ::AI_AVAILABLE 1; dbg "provider = deepseek (legacy deepseek.json)" }
+    } err]} { logsys warning "cannot read legacy deepseek.json: $err — running without AI" }
 }
 
 proc loadSystemPrompts {} {
@@ -546,6 +628,9 @@ set ::PANE_BG  "#ffffff"
 proc build_review_ui {} {
     wm title . "Scribe"
     set srcLabel [expr {$::INPUT eq "clipboard" ? "Clipboard" : "Dictated"}]
+    # The styled pane and its controls exist only when an AI provider is
+    # configured; with none, scribe shows a single dictation pane (see CLAUDE.md).
+    set styleable $::AI_AVAILABLE
 
     pack [ttk::frame .pane1 -padding 6] -fill both -expand 1
     pack [ttk::label .pane1.lbl -text $srcLabel] -anchor w
@@ -553,17 +638,19 @@ proc build_review_ui {} {
     pack .pane1.txt -fill both -expand 1
     bind .pane1.txt <Button-1> {setActiveArea 1; focus .; break}
 
-    pack [ttk::frame .pane2 -padding 6] -fill both -expand 1
-    pack [ttk::label .pane2.lbl -text "Styled ($::STYLE_NAME)"] -anchor w
-    text .pane2.txt -height 8 -width 80 -wrap word -relief solid -borderwidth 2 -takefocus 0
-    pack .pane2.txt -fill both -expand 1
-    bind .pane2.txt <Button-1> {setActiveArea 2; focus .; break}
+    if {$styleable} {
+        pack [ttk::frame .pane2 -padding 6] -fill both -expand 1
+        pack [ttk::label .pane2.lbl -text "Styled ($::STYLE_NAME)"] -anchor w
+        text .pane2.txt -height 8 -width 80 -wrap word -relief solid -borderwidth 2 -takefocus 0
+        pack .pane2.txt -fill both -expand 1
+        bind .pane2.txt <Button-1> {setActiveArea 2; focus .; break}
+    }
 
     set primary [expr {$::DELIVER eq "type" ? "Type" : ($::DELIVER eq "clipboard" ? "Copy" : "Paste")}]
     pack [ttk::frame .btns -padding 6] -fill x
     ttk::button .btns.go -text "$primary  (Space; Enter = + ↵)" -command {deliver_now [active_text] 0} -takefocus 0
     pack .btns.go -side left -padx 4
-    if {$::STYLE_ON} {
+    if {$styleable && $::STYLE_ON} {
         ttk::button .btns.style -text "Style" -command {run_rewrite} -takefocus 0
         pack .btns.style -side left -padx 4
     }
@@ -572,13 +659,17 @@ proc build_review_ui {} {
 
     .pane1.txt insert 1.0 $::sourceText
     .pane1.txt configure -state disabled
-    if {!$::STYLE_ON} { paneRewriteStatus "(no style pass — pass --style to enable)" }
-    .pane2.txt configure -state disabled
+    if {$styleable} {
+        if {!$::STYLE_ON} { paneRewriteStatus "(no style pass — pass --style to enable)" }
+        .pane2.txt configure -state disabled
+    }
 
     bind . <space>  {deliver_now [active_text] 0; break}
     bind . <Return> {deliver_now [active_text] 1; break}
-    bind . <Up>     {setActiveArea 1; break}
-    bind . <Down>   {setActiveArea 2; break}
+    if {$styleable} {
+        bind . <Up>   {setActiveArea 1; break}
+        bind . <Down> {setActiveArea 2; break}
+    }
     wm protocol . WM_DELETE_WINDOW {set_clipboard [active_text]; finish 0}
     refresh_highlight
 }
@@ -592,7 +683,9 @@ proc setActiveArea {n} { set ::activeArea $n; refresh_highlight }
 proc refresh_highlight {} {
     if {![winfo exists .pane1.txt]} return
     .pane1.txt configure -background [expr {$::activeArea == 1 ? $::HL_COLOR : $::PANE_BG}]
-    .pane2.txt configure -background [expr {$::activeArea == 2 ? $::HL_COLOR : $::PANE_BG}]
+    if {[winfo exists .pane2.txt]} {
+        .pane2.txt configure -background [expr {$::activeArea == 2 ? $::HL_COLOR : $::PANE_BG}]
+    }
 }
 
 #==============================================================================
@@ -933,20 +1026,30 @@ proc run_self_test {} {
     check "paste key" {$::PASTE_KEY eq "key ctrl+v"}
     check "enter key" {$::ENTER_KEY eq "key enter"}
 
+    set _toml [parse_toml "default_provider = \"x\"\n# a comment\n\[provider.x\]\napi_key = \"k\"\nmodel = 'm'  # inline\n"]
+    check "toml default_provider" {[dict get $_toml "" default_provider] eq "x"}
+    check "toml provider table"   {[dict get $_toml "provider.x" api_key] eq "k"}
+    check "toml single-quote val" {[dict get $_toml "provider.x" model] eq "m"}
+
     set ::sourceText "src"; set ::rewriteText "rw"; setActiveArea 1
     check "active=source pane1" {[active_text] eq "src"}
     setActiveArea 2
     check "active=rewrite pane2" {[active_text] eq "rw"}
 
     set ::WINDOW 1; set ::SELF_TEST 1; set ::QSTYLE double
-    set ::sourceText "so the meeting moves to friday because the client called"
-    set ::rewriteState idle; set ::testDone 0
-    run_rewrite
-    set aid [after 65000 {set ::testDone timeout}]
-    vwait ::testDone
-    after cancel $aid
-    check "style pass returned" {$::rewriteState eq "done" && [string length $::rewriteText] > 0} "(state=$::rewriteState)"
-    puts "    STYLED: $::rewriteText"
+    if {$::AI_AVAILABLE} {
+        loadSystemPrompts; loadStyle
+        set ::sourceText "so the meeting moves to friday because the client called"
+        set ::rewriteState idle; set ::testDone 0
+        run_rewrite
+        set aid [after 65000 {set ::testDone timeout}]
+        vwait ::testDone
+        after cancel $aid
+        check "style pass returned" {$::rewriteState eq "done" && [string length $::rewriteText] > 0} "(state=$::rewriteState)"
+        puts "    STYLED: $::rewriteText"
+    } else {
+        puts "SKIP: style pass (no AI provider configured)"
+    }
 
     set ::DELIVER clipboard
     if {![catch {set_clipboard "round-trip-probe"}]} {
@@ -956,7 +1059,12 @@ proc run_self_test {} {
 
     set ::STYLE_ON 1; set ::INPUT mic; set ::STYLE_NAME "clear"; set ::DELIVER paste
     if {![catch {build_review_ui} e]} {
-        check "review UI builds" {[winfo exists .pane1.txt] && [winfo exists .btns.go] && [winfo exists .btns.style]}
+        set ok [expr {[winfo exists .pane1.txt] && [winfo exists .btns.go]}]
+        if {$::AI_AVAILABLE} {
+            check "review UI builds (styled pane present)" {$ok && [winfo exists .pane2.txt] && [winfo exists .btns.style]}
+        } else {
+            check "review UI builds (dictation only, no styled pane)" {$ok && ![winfo exists .pane2.txt] && ![winfo exists .btns.style]}
+        }
     } else { check "review UI builds" 0 "($e)" }
 
     puts [expr {$fail ? "SELF-TEST: FAIL" : "SELF-TEST: PASS"}]
@@ -984,10 +1092,15 @@ if {$::QUOTES ne ""} {
     set ::QSTYLE [expr {$::DIALECT eq "british" ? "single" : "double"}]
 }
 
-loadDeepSeekConfig
-loadSystemPrompts
+loadConfig
 loadDialect
-if {$::STYLE_ON} { loadStyle }
+# The style pass is strictly additive (see CLAUDE.md): with no AI provider
+# configured, scribe degrades to a dictation tool rather than failing.
+if {$::STYLE_ON && !$::AI_AVAILABLE} {
+    logsys notice "no AI provider configured — style pass disabled; running as dictation"
+    set ::STYLE_ON 0
+}
+if {$::STYLE_ON} { loadStyle; loadSystemPrompts }
 
 if {$::SELF_TEST} { after idle run_self_test; vwait forever }
 if {$::TEST_TEXT ne ""} { after idle [list on_source_ready $::TEST_TEXT]; vwait forever }

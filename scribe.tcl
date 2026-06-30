@@ -666,6 +666,7 @@ proc build_review_ui {} {
 
     bind . <space>  {deliver_now [active_text] 0; break}
     bind . <Return> {deliver_now [active_text] 1; break}
+    bind . <Escape> {finish 0; break}
     if {$styleable} {
         bind . <Up>   {setActiveArea 1; break}
         bind . <Down> {setActiveArea 2; break}

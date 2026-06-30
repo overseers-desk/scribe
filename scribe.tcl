@@ -34,7 +34,7 @@ set ::DIALECT_FILE     [file join $::APP_DIR "dialect-us-to-british.tsv"]
 set ::LOG_DIR          /var/local/log/dictation
 set ::CACHE_DIR        [file join [expr {[info exists ::env(XDG_CACHE_HOME)] && $::env(XDG_CACHE_HOME) ne "" ? $::env(XDG_CACHE_HOME) : "$::env(HOME)/.cache"}] scribe]
 
-set ::VERSION          0.6
+set ::VERSION          0.6.1
 set ::PORT             4212
 set ::APPNAME          "scribe-[pid]"
 

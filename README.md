@@ -70,6 +70,31 @@ Other requirements:
    with the Wayland-native Tk build. A second press of a `--input mic` shortcut
    stops the recording started by the first.
 
+   For example, to bind dictation to the `Insert` key under GNOME, add a custom
+   keybinding whose command is:
+
+   ```
+   env LD_LIBRARY_PATH=/usr/local/src/tk-wayland/unix /usr/local/src/tk-wayland/unix/wish \
+     code/scribe/scribe.tcl --input mic --deliver paste --dialect british \
+     --timeout 300 --window --model code/whisper.cpp/models/ggml-medium.en.bin \
+     --prompt-file code/dotfiles/.whisper-prompt-file
+   ```
+
+   Here `wish` is a locally built Wayland-native Tk, invoked through its own
+   `LD_LIBRARY_PATH`, because no Wayland-built `wish` release is available yet.
+   Once a Wayland-native Tk 9 is packaged, the `env LD_LIBRARY_PATH=…` prefix
+   and absolute `wish` path can be dropped for a plain `wish9.0`. Set the
+   binding from the command line with:
+
+   ```sh
+   dir=/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom0/
+   base=org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$dir
+   gsettings set org.gnome.settings-daemon.plugins.media-keys custom-keybindings "['$dir']"
+   gsettings set "$base" name 'Insert Voice Message'
+   gsettings set "$base" binding 'Insert'
+   gsettings set "$base" command 'env LD_LIBRARY_PATH=/usr/local/src/tk-wayland/unix /usr/local/src/tk-wayland/unix/wish code/scribe/scribe.tcl --input mic --deliver paste --dialect british --timeout 300 --window --model code/whisper.cpp/models/ggml-medium.en.bin --prompt-file code/dotfiles/.whisper-prompt-file'
+   ```
+
 ## Presets
 
 | Goal | Command |

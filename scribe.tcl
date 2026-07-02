@@ -19,7 +19,8 @@ package require Tk 9
 # Bind presets to GNOME custom shortcuts launching the custom Wayland wish with
 # LD_LIBRARY_PATH set, the way the companion dictation tool is bound.
 #
-# Requires: dotool, whisper-cli, parecord (PulseAudio), wl-copy (wl-clipboard).
+# Requires: dotool, whisper-cli, parecord (PulseAudio), and a clipboard tool —
+# wl-copy (wl-clipboard) under Wayland or xclip under X11.
 #
 # The style pass is optional. AI providers are configured in config.toml
 # (~/.config/scribe/config.toml): a [provider.NAME] table per provider plus a
@@ -106,6 +107,7 @@ set ::autosend_id   ""
 set ::dotool_pid    0
 set ::dotool_id     ""
 set ::ukmap         ""
+set ::clipBackend   ""          ;# resolved once: wayland (wl-copy) | x11 (xclip)
 
 # --- review ---
 set ::sourceText    ""
@@ -520,7 +522,25 @@ proc styleDone {} {
 # DELIVERY
 #==============================================================================
 
-proc set_clipboard {txt} { exec wl-copy -- $txt }
+# Clipboard write. Wayland uses wl-copy, X11 uses xclip; the backend is decided
+# once from the session's Wayland socket. Injection (dotool) is uinput-level and
+# display-agnostic, so only the clipboard needs this split.
+proc clip_backend {} {
+    if {$::clipBackend ne ""} { return $::clipBackend }
+    if {[info exists ::env(WAYLAND_DISPLAY)] && $::env(WAYLAND_DISPLAY) ne "" \
+            && ![catch {exec which wl-copy}]} {
+        set ::clipBackend wayland
+    } else {
+        set ::clipBackend x11
+    }
+    return $::clipBackend
+}
+proc set_clipboard {txt} {
+    # xclip daemonises to hold the X11 selection; redirect its stdout/stderr off
+    # Tcl's pipe or exec blocks waiting for the child to close inherited fds.
+    if {[clip_backend] eq "x11"} { exec xclip -selection clipboard >/dev/null 2>/dev/null << $txt } \
+    else                         { exec wl-copy -- $txt }
+}
 proc active_text {} { return [expr {$::activeArea == 2 ? $::rewriteText : $::sourceText}] }
 
 # dotool actions to type TEXT, two-rate cadence + IBus Ctrl+Shift+U for
@@ -853,6 +873,9 @@ proc save_debug_command {wcmd} {
 proc transcribe {} {
     if {$::done} return
     set ::done 1
+    # The --test-file path reaches here without start_recording, so ensure the
+    # cache dir (home of the whisper stderr file below) exists on both paths.
+    file mkdir $::CACHE_DIR
     set wcmd [list whisper-cli -m $::MODEL -f $::tmpfile -nt -l $::LANG -t $::THREADS]
     if {$::PROMPT ne ""}   { lappend wcmd --prompt $::PROMPT }
     if {$::NO_FALLBACK}    { lappend wcmd --no-fallback }
@@ -1054,7 +1077,9 @@ proc run_self_test {} {
 
     set ::DELIVER clipboard
     if {![catch {set_clipboard "round-trip-probe"}]} {
-        set back ""; catch {set back [exec wl-paste -n]}
+        set back ""
+        if {[clip_backend] eq "x11"} { catch {set back [exec xclip -selection clipboard -o]} } \
+        else                         { catch {set back [exec wl-paste -n]} }
         check "clipboard round-trip" {$back eq "round-trip-probe"}
     }
 

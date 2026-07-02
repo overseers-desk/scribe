@@ -876,6 +876,13 @@ proc transcribe {} {
     # The --test-file path reaches here without start_recording, so ensure the
     # cache dir (home of the whisper stderr file below) exists on both paths.
     file mkdir $::CACHE_DIR
+    # Fail loudly on a missing model rather than let whisper-cli emit nothing and
+    # deliver blank. --model is often given relative; report the cwd it resolved
+    # against so a wrong relative path is obvious.
+    if {![file exists $::MODEL]} {
+        logsys err "whisper model not found: $::MODEL (resolved from cwd [pwd]); pass an absolute --model"
+        finish 1; return
+    }
     set wcmd [list whisper-cli -m $::MODEL -f $::tmpfile -nt -l $::LANG -t $::THREADS]
     if {$::PROMPT ne ""}   { lappend wcmd --prompt $::PROMPT }
     if {$::NO_FALLBACK}    { lappend wcmd --no-fallback }
@@ -899,6 +906,10 @@ proc transcribe_collect {} {
     append ::wbuf [read $::wchan]
     if {![eof $::wchan]} return
     fileevent $::wchan readable {}
+    # A non-blocking channel's close does not wait for the child or report its
+    # exit status, so whisper-cli failures (missing model, GPU OOM) would pass
+    # silently and deliver blank. Restore blocking so close surfaces the status.
+    fconfigure $::wchan -blocking 1
     if {[catch {close $::wchan} cerr]} {
         set tail [whisper_stderr]
         logsys err "whisper-cli failed: $cerr[expr {$tail ne "" ? ": $tail" : ""}]"
@@ -907,6 +918,12 @@ proc transcribe_collect {} {
     }
     if {!$::debug_mode} { catch {file delete $::werrfile} }
     stop_animate
+    # An empty transcript after a clean exit is not an error, but it is the other
+    # way a blank result happens (silence, wrong audio format, wrong model), so
+    # say so rather than deliver nothing without explanation.
+    if {[string trim $::wbuf] eq ""} {
+        logsys warning "whisper returned an empty transcript (silence, wrong audio format, or wrong model?)"
+    }
     catch {save_log $::wbuf}
     on_source_ready $::wbuf
 }

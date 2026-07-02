@@ -30,16 +30,16 @@ Runtime commands (must be on `PATH`):
 | `whisper-cli` | speech-to-text (whisper.cpp) | `--input mic` |
 | `parecord` | audio capture (PulseAudio / pipewire-pulse) | `--input mic` |
 | `dotool` | keystroke injection via uinput | `--deliver type`, and the paste keystroke |
-| `wl-copy` / `wl-paste` | Wayland clipboard (wl-clipboard) | `--deliver paste` and `clipboard` |
 
 Other requirements:
 
-- **Tcl/Tk 9** with a working `wish9.0` and `tk systray`. Under GNOME on Wayland
-  this needs a Wayland-native Tk build, because the stock X11 Tk cannot draw the
-  tray icon or inject focus there. The Tcl packages `http`, `tls`, `json`, and
-  `yaml` must be available to that interpreter.
+- **Tcl/Tk 9** with a working `wish9.0` and `tk systray`. The Tcl packages
+  `http`, `tls`, `json`, and `yaml` must be available to that interpreter. On
+  Ubuntu those were provided by tcllib. With OS X brew they came with tcl9.
+
 - A **whisper model** file (for example `ggml-medium.en.bin`), passed with
   `--model`, for `--input mic`.
+
 - An **AI provider** in `config.toml`, only for `--style` (optional; see below).
 - `dotool` needs access to `/dev/uinput` (typically membership of the `input`
   group). For non-ASCII characters (curly quotes, accented names) the `--deliver
@@ -63,28 +63,19 @@ Other requirements:
    `--provider NAME` or `default_provider`. Skip this entirely to run dictation
    only. A legacy single-provider `deepseek.json` is still honoured if present.
 
-2. Make the script executable: `chmod +x scribe.tcl`.
+2. Bind the presets you want to global shortcuts (GNOME custom keyboard
+   shortcuts, or your desktop's equivalent).
 
-3. Bind the presets you want to global shortcuts (GNOME custom keyboard
-   shortcuts, or your desktop's equivalent), launching `wish9.0 scribe.tcl …`
-   with the Wayland-native Tk build. A second press of a `--input mic` shortcut
-   stops the recording started by the first.
+   A second press of a `--input mic` shortcut stops the recording started by the first.
 
    For example, to bind dictation to the `Insert` key under GNOME, add a custom
    keybinding whose command is:
 
    ```
-   env LD_LIBRARY_PATH=/usr/local/src/tk-wayland/unix /usr/local/src/tk-wayland/unix/wish \
      code/scribe/scribe.tcl --input mic --deliver paste --dialect british \
      --timeout 300 --window --model code/whisper.cpp/models/ggml-medium.en.bin \
-     --prompt-file code/dotfiles/.whisper-prompt-file
+     --prompt-file ~/.whisper-prompt-file
    ```
-
-   Here `wish` is a locally built Wayland-native Tk, invoked through its own
-   `LD_LIBRARY_PATH`, because no Wayland-built `wish` release is available yet.
-   Once a Wayland-native Tk 9 is packaged, the `env LD_LIBRARY_PATH=…` prefix
-   and absolute `wish` path can be dropped for a plain `wish9.0`. Set the
-   binding from the command line with:
 
    ```sh
    dir=/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom0/
@@ -92,7 +83,7 @@ Other requirements:
    gsettings set org.gnome.settings-daemon.plugins.media-keys custom-keybindings "['$dir']"
    gsettings set "$base" name 'Insert Voice Message'
    gsettings set "$base" binding 'Insert'
-   gsettings set "$base" command 'env LD_LIBRARY_PATH=/usr/local/src/tk-wayland/unix /usr/local/src/tk-wayland/unix/wish code/scribe/scribe.tcl --input mic --deliver paste --dialect british --timeout 300 --window --model code/whisper.cpp/models/ggml-medium.en.bin --prompt-file code/dotfiles/.whisper-prompt-file'
+   gsettings set "$base" command '[the above launch command]'
    ```
 
 ## Presets

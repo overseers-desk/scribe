@@ -21,6 +21,21 @@ The style pass is the only feature that needs an API key. With no configuration
 and no key, scribe still runs as a dictation tool — the style pass and the styled
 review pane are simply absent.
 
+## Install
+
+Homebrew (Linux; the macOS port is incomplete):
+
+```
+brew tap overseers-desk/od
+brew install scribe
+```
+
+The formula installs scribe and Tcl/Tk only; it does not pull the mic-path
+runtime commands. For `--input mic`, install whisper.cpp separately
+(`brew install whisper-cpp` provides `whisper-cli`) and supply a whisper model
+file such as `ggml-medium.en.bin`. `parecord` and `dotool` must also be on
+`PATH` (see Dependencies below).
+
 ## Dependencies
 
 Runtime commands (must be on `PATH`):

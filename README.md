@@ -34,8 +34,8 @@ On macOS the formula pulls `sox` for audio capture; keystrokes and clipboard go
 through the system's own `osascript` and `pbcopy`. On Linux the formula installs
 scribe and Tcl/Tk only. For `--input mic`, install whisper.cpp separately
 (`brew install whisper-cpp` provides `whisper-cli`) and supply a whisper model
-file such as `ggml-medium.en.bin`. On Linux, a recorder (`sox` or `pw-record`)
-and `dotool` must also be on `PATH` (see Dependencies below).
+file such as `ggml-medium.en.bin`. On Linux, a recorder (`pw-record`, or `sox`
+as fallback) and `dotool` must also be on `PATH` (see Dependencies below).
 
 ## Dependencies
 
@@ -44,8 +44,8 @@ Runtime commands (must be on `PATH`):
 | Command | Provides | Needed for |
 |---------|----------|------------|
 | `whisper-cli` | speech-to-text (whisper.cpp) | `--input mic` |
-| `sox` | audio capture (preferred; pulseaudio backend on Linux, coreaudio on macOS) | `--input mic` |
-| `pw-record` | audio capture (PipeWire; Linux fallback when sox is absent) | `--input mic` |
+| `pw-record` | audio capture (PipeWire; preferred on Linux) | `--input mic` |
+| `sox` | audio capture (macOS via coreaudio; Linux fallback when pw-record is absent) | `--input mic` |
 | `dotool` | keystroke injection via uinput (Linux) | `--deliver type`, and the paste keystroke |
 
 On macOS, keystrokes go through `osascript` (System Events) and the clipboard

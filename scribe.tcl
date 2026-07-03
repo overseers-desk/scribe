@@ -20,7 +20,7 @@ package require Tk 9
 # LD_LIBRARY_PATH set, the way the companion dictation tool is bound.
 #
 # Requires: whisper-cli plus per-platform helpers.
-#   Recording : sox where present (Linux and macOS), else pw-record (Linux).
+#   Recording : pw-record (PipeWire, Linux; sox as fallback); sox (macOS).
 #   Keystrokes: dotool (Linux, uinput); osascript System Events (macOS).
 #   Clipboard : wl-copy under Wayland, xclip under X11, pbcopy on macOS.
 #
@@ -970,10 +970,10 @@ proc poll_recorder {} {
     if {[catch {exec kill -0 $::recorder_pid}]} { set ::recorder_pid 0; transcribe } \
     else { set ::poll_id [after 200 poll_recorder] }
 }
-# sox where present (both platforms), else pw-record (Linux).
+# Linux: pw-record, else sox. macOS: sox.
 proc resolve_recorder {} {
-    if {![catch {exec which sox}]} { return sox }
     if {!$::MACOS && ![catch {exec which pw-record}]} { return pw-record }
+    if {![catch {exec which sox}]} { return sox }
     return ""
 }
 proc start_recording {} {
@@ -1131,7 +1131,11 @@ proc run_self_test {} {
         check "paste key" {$::PASTE_KEY eq "key ctrl+v"}
         check "enter key" {$::ENTER_KEY eq "key enter"}
     }
-    if {![catch {exec which sox}]} { check "recorder prefers sox" {[resolve_recorder] eq "sox"} }
+    if {$::MACOS} {
+        if {![catch {exec which sox}]} { check "recorder is sox" {[resolve_recorder] eq "sox"} }
+    } elseif {![catch {exec which pw-record}]} {
+        check "recorder prefers pw-record" {[resolve_recorder] eq "pw-record"}
+    }
 
     set _toml [parse_toml "default_provider = \"x\"\n# a comment\n\[provider.x\]\napi_key = \"k\"\nmodel = 'm'  # inline\n"]
     check "toml default_provider" {[dict get $_toml "" default_provider] eq "x"}

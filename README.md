@@ -33,7 +33,7 @@ brew install scribe
 The formula installs scribe and Tcl/Tk only; it does not pull the mic-path
 runtime commands. For `--input mic`, install whisper.cpp separately
 (`brew install whisper-cpp` provides `whisper-cli`) and supply a whisper model
-file such as `ggml-medium.en.bin`. `parecord` and `dotool` must also be on
+file such as `ggml-medium.en.bin`. `pw-record` and `dotool` must also be on
 `PATH` (see Dependencies below).
 
 ## Dependencies
@@ -43,7 +43,7 @@ Runtime commands (must be on `PATH`):
 | Command | Provides | Needed for |
 |---------|----------|------------|
 | `whisper-cli` | speech-to-text (whisper.cpp) | `--input mic` |
-| `parecord` | audio capture (PulseAudio / pipewire-pulse) | `--input mic` |
+| `pw-record` | audio capture (PipeWire) | `--input mic` |
 | `dotool` | keystroke injection via uinput | `--deliver type`, and the paste keystroke |
 
 Other requirements:

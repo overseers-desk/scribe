@@ -19,7 +19,7 @@ package require Tk 9
 # Bind presets to GNOME custom shortcuts launching the custom Wayland wish with
 # LD_LIBRARY_PATH set, the way the companion dictation tool is bound.
 #
-# Requires: dotool, whisper-cli, parecord (PulseAudio), and a clipboard tool —
+# Requires: dotool, whisper-cli, pw-record (PipeWire), and a clipboard tool —
 # wl-copy (wl-clipboard) under Wayland or xclip under X11.
 #
 # The style pass is optional. AI providers are configured in config.toml
@@ -94,7 +94,7 @@ set ::singlePassPrefix ""
 set ::styleGuide       ""
 
 # --- runtime ---
-set ::parecord_pid  0
+set ::pw_record_pid  0
 set ::tmpfile       ""
 set ::log_stem      ""
 set ::auto_stop_id  ""
@@ -927,10 +927,10 @@ proc transcribe_collect {} {
     catch {save_log $::wbuf}
     on_source_ready $::wbuf
 }
-proc poll_parecord {} {
-    if {$::parecord_pid == 0} return
-    if {[catch {exec kill -0 $::parecord_pid}]} { set ::parecord_pid 0; transcribe } \
-    else { set ::poll_id [after 200 poll_parecord] }
+proc poll_pw_record {} {
+    if {$::pw_record_pid == 0} return
+    if {[catch {exec kill -0 $::pw_record_pid}]} { set ::pw_record_pid 0; transcribe } \
+    else { set ::poll_id [after 200 poll_pw_record] }
 }
 proc start_recording {} {
     file mkdir $::CACHE_DIR
@@ -946,13 +946,16 @@ proc start_recording {} {
     set ::start_ms [clock milliseconds]
     set source ""
     if {$::CAPTURE ne ""} { set source [resolve_source $::CAPTURE] }
-    set pcmd [list parecord --channels=1 --rate=16000 --format=s16ne --file-format=wav]
-    if {$source ne ""} { lappend pcmd "--device=$source" }
+    # pw-record drains its capture buffer on SIGTERM (parecord discarded ~2s of
+    # it, losing the tail of every recording); it writes a finalised WAV header
+    # on that clean exit, which stop_recording relies on.
+    set pcmd [list pw-record --rate=16000 --channels=1 --format=s16]
+    if {$source ne ""} { lappend pcmd "--target=$source" }
     lappend pcmd $::tmpfile
-    if {[catch {set ::parecord_pid [exec {*}$pcmd &]} err]} {
-        logsys err "failed to start parecord: $err"; finish 1; return
+    if {[catch {set ::pw_record_pid [exec {*}$pcmd &]} err]} {
+        logsys err "failed to start pw-record: $err"; finish 1; return
     }
-    set ::poll_id [after 200 poll_parecord]
+    set ::poll_id [after 200 poll_pw_record]
     set ::auto_stop_id [after [expr {$::TIMEOUT_S * 1000}] stop_recording]
 }
 
@@ -987,13 +990,13 @@ proc handle_client {sock _addr _port} {
         stop  { puts $sock "OK"; after idle stop_recording }
         pause {
             if {$::state eq "paused"} { puts $sock "ACK already-paused" } \
-            elseif {$::parecord_pid > 0 && ![catch {exec kill -STOP $::parecord_pid}]} {
+            elseif {$::pw_record_pid > 0 && ![catch {exec kill -STOP $::pw_record_pid}]} {
                 set ::state paused; stop_animate; draw_icon [recording_frac] recording 1; puts $sock "OK"
             } else { puts $sock "ACK pause-failed" }
         }
         resume {
             if {$::state ne "paused"} { puts $sock "ACK not-paused" } \
-            elseif {$::parecord_pid > 0 && ![catch {exec kill -CONT $::parecord_pid}]} {
+            elseif {$::pw_record_pid > 0 && ![catch {exec kill -CONT $::pw_record_pid}]} {
                 enter_state recording; puts $sock "OK"
             } else { puts $sock "ACK resume-failed" }
         }
@@ -1005,9 +1008,9 @@ proc handle_client {sock _addr _port} {
 proc stop_recording {} {
     stop_listener
     if {$::auto_stop_id ne ""} { after cancel $::auto_stop_id; set ::auto_stop_id "" }
-    if {$::parecord_pid > 0} {
-        if {$::state eq "paused"} { catch {exec kill -CONT $::parecord_pid} }
-        catch {exec kill $::parecord_pid}
+    if {$::pw_record_pid > 0} {
+        if {$::state eq "paused"} { catch {exec kill -CONT $::pw_record_pid} }
+        catch {exec kill $::pw_record_pid}
     }
     if {$::state ne "transcribing"} { enter_state transcribing }
 }

@@ -19,8 +19,10 @@ package require Tk 9
 # Bind presets to GNOME custom shortcuts launching the custom Wayland wish with
 # LD_LIBRARY_PATH set, the way the companion dictation tool is bound.
 #
-# Requires: dotool, whisper-cli, pw-record (PipeWire), and a clipboard tool —
-# wl-copy (wl-clipboard) under Wayland or xclip under X11.
+# Requires: whisper-cli plus per-platform helpers.
+#   Recording : sox where present (Linux and macOS), else pw-record (Linux).
+#   Keystrokes: dotool (Linux, uinput); osascript System Events (macOS).
+#   Clipboard : wl-copy under Wayland, xclip under X11, pbcopy on macOS.
 #
 # The style pass is optional. AI providers are configured in config.toml
 # (~/.config/scribe/config.toml): a [provider.NAME] table per provider plus a
@@ -41,9 +43,10 @@ set ::DIALECT_FILE     [file join $::APP_DIR "dialect-us-to-british.tsv"]
 set ::LOG_DIR          /var/local/log/dictation
 set ::CACHE_DIR        [file join [expr {[info exists ::env(XDG_CACHE_HOME)] && $::env(XDG_CACHE_HOME) ne "" ? $::env(XDG_CACHE_HOME) : "$::env(HOME)/.cache"}] scribe]
 
-set ::VERSION          0.6.1
+set ::VERSION          0.6.2
 set ::PORT             4212
 set ::APPNAME          "scribe-[pid]"
+set ::MACOS            [expr {$::tcl_platform(os) eq "Darwin"}]
 
 # --- axes ---
 set ::INPUT            ""          ;# mic | clipboard
@@ -94,7 +97,7 @@ set ::singlePassPrefix ""
 set ::styleGuide       ""
 
 # --- runtime ---
-set ::pw_record_pid  0
+set ::recorder_pid  0
 set ::tmpfile       ""
 set ::log_stem      ""
 set ::auto_stop_id  ""
@@ -104,8 +107,8 @@ set ::state         idle
 set ::done          0
 set ::httpToken     ""
 set ::autosend_id   ""
-set ::dotool_pid    0
-set ::dotool_id     ""
+set ::inject_pid    0
+set ::inject_id     ""
 set ::ukmap         ""
 set ::clipBackend   ""          ;# resolved once: wayland (wl-copy) | x11 (xclip)
 
@@ -522,12 +525,14 @@ proc styleDone {} {
 # DELIVERY
 #==============================================================================
 
-# Clipboard write. Wayland uses wl-copy, X11 uses xclip; the backend is decided
-# once from the session's Wayland socket. Injection (dotool) is uinput-level and
-# display-agnostic, so only the clipboard needs this split.
+# Clipboard write. macOS uses pbcopy, Wayland wl-copy, X11 xclip; the backend
+# is decided once from the platform and the session's Wayland socket. Injection
+# is display-agnostic on each platform, so only the clipboard needs this split.
 proc clip_backend {} {
     if {$::clipBackend ne ""} { return $::clipBackend }
-    if {[info exists ::env(WAYLAND_DISPLAY)] && $::env(WAYLAND_DISPLAY) ne "" \
+    if {$::MACOS} {
+        set ::clipBackend macos
+    } elseif {[info exists ::env(WAYLAND_DISPLAY)] && $::env(WAYLAND_DISPLAY) ne "" \
             && ![catch {exec which wl-copy}]} {
         set ::clipBackend wayland
     } else {
@@ -536,10 +541,16 @@ proc clip_backend {} {
     return $::clipBackend
 }
 proc set_clipboard {txt} {
-    # xclip daemonises to hold the X11 selection; redirect its stdout/stderr off
-    # Tcl's pipe or exec blocks waiting for the child to close inherited fds.
-    if {[clip_backend] eq "x11"} { exec xclip -selection clipboard >/dev/null 2>/dev/null << $txt } \
-    else                         { exec wl-copy -- $txt }
+    switch -- [clip_backend] {
+        macos   { exec pbcopy << $txt }
+        wayland { exec wl-copy -- $txt }
+        x11     {
+            # xclip daemonises to hold the X11 selection; redirect its
+            # stdout/stderr off Tcl's pipe or exec blocks waiting for the
+            # child to close inherited fds.
+            exec xclip -selection clipboard >/dev/null 2>/dev/null << $txt
+        }
+    }
 }
 proc active_text {} { return [expr {$::activeArea == 2 ? $::rewriteText : $::sourceText}] }
 
@@ -585,19 +596,35 @@ proc _emit_run {out_var buf} {
     lappend out "type $buf"
 }
 
+# AppleScript string literal for TEXT: escape backslash and quote, encode
+# newlines as \n (System Events keystroke sends them as Return).
+proc applescript_quote {text} {
+    return "\"[string map [list \\ \\\\ \" \\\" \n \\n \r \\r] $text]\""
+}
 proc inject_text {text} {
+    if {$::MACOS} {
+        set text [string trim $text]
+        if {$text eq ""} { finish 0; return }
+        enter_state typing
+        set script "tell application \"System Events\" to keystroke [applescript_quote $text]"
+        if {[catch {set ::inject_pid [exec osascript -e $script &]} err]} {
+            logsys err "osascript keystroke failed: $err"; finish 1; return
+        }
+        poll_inject
+        return
+    }
     set actions [build_inject_actions $text]
     if {$actions eq ""} { finish 0; return }
     enter_state typing
-    if {[catch {set ::dotool_pid [exec dotool << $actions &]} err]} {
+    if {[catch {set ::inject_pid [exec dotool << $actions &]} err]} {
         logsys err "dotool failed: $err"; finish 1; return
     }
-    poll_dotool
+    poll_inject
 }
-proc poll_dotool {} {
-    if {$::dotool_pid == 0} return
-    if {[catch {exec kill -0 $::dotool_pid}]} { set ::dotool_pid 0; finish 0 } \
-    else { set ::dotool_id [after 150 poll_dotool] }
+proc poll_inject {} {
+    if {$::inject_pid == 0} return
+    if {[catch {exec kill -0 $::inject_pid}]} { set ::inject_pid 0; finish 0 } \
+    else { set ::inject_id [after 150 poll_inject] }
 }
 
 proc deliver_now {text {withEnter 0}} {
@@ -622,10 +649,20 @@ proc deliver_now {text {withEnter 0}} {
     }
 }
 proc do_paste_exec {withEnter} {
-    if {[catch {exec dotool << $::PASTE_KEY} err]} { logsys err "dotool paste failed: $err"; finish 1; return }
+    if {$::MACOS} {
+        # Cmd+V through System Events; needs Accessibility permission.
+        set cmd [list osascript -e {tell application "System Events" to keystroke "v" using command down}]
+    } else {
+        set cmd [list dotool << $::PASTE_KEY]
+    }
+    if {[catch {exec {*}$cmd} err]} { logsys err "paste keystroke failed: $err"; finish 1; return }
     if {$withEnter} { after $::PASTE_ENTER_GAP_MS do_paste_enter } else { finish 0 }
 }
-proc do_paste_enter {} { catch {exec dotool << $::ENTER_KEY}; finish 0 }
+proc do_paste_enter {} {
+    if {$::MACOS} { catch {exec osascript -e {tell application "System Events" to key code 36}} } \
+    else          { catch {exec dotool << $::ENTER_KEY} }
+    finish 0
+}
 
 proc cancel_pending {} {
     if {$::autosend_id ne ""} { after cancel $::autosend_id; set ::autosend_id "" }
@@ -814,6 +851,7 @@ proc enter_state {newstate} { stop_animate; set ::state $newstate; set ::blink 1
 
 proc resolve_source {capture} {
     if {![string is integer -strict $capture]} { return $capture }
+    if {$::MACOS} { fatal "--capture N (numeric) needs pactl and is Linux-only; pass the CoreAudio device name" }
     set sources {}
     foreach line [split [exec pactl list sources short] \n] {
         set name [lindex $line 1]
@@ -927,10 +965,16 @@ proc transcribe_collect {} {
     catch {save_log $::wbuf}
     on_source_ready $::wbuf
 }
-proc poll_pw_record {} {
-    if {$::pw_record_pid == 0} return
-    if {[catch {exec kill -0 $::pw_record_pid}]} { set ::pw_record_pid 0; transcribe } \
-    else { set ::poll_id [after 200 poll_pw_record] }
+proc poll_recorder {} {
+    if {$::recorder_pid == 0} return
+    if {[catch {exec kill -0 $::recorder_pid}]} { set ::recorder_pid 0; transcribe } \
+    else { set ::poll_id [after 200 poll_recorder] }
+}
+# sox where present (both platforms), else pw-record (Linux).
+proc resolve_recorder {} {
+    if {![catch {exec which sox}]} { return sox }
+    if {!$::MACOS && ![catch {exec which pw-record}]} { return pw-record }
+    return ""
 }
 proc start_recording {} {
     file mkdir $::CACHE_DIR
@@ -946,16 +990,31 @@ proc start_recording {} {
     set ::start_ms [clock milliseconds]
     set source ""
     if {$::CAPTURE ne ""} { set source [resolve_source $::CAPTURE] }
-    # pw-record drains its capture buffer on SIGTERM (parecord discarded ~2s of
-    # it, losing the tail of every recording); it writes a finalised WAV header
-    # on that clean exit, which stop_recording relies on.
-    set pcmd [list pw-record --rate=16000 --channels=1 --format=s16]
-    if {$source ne ""} { lappend pcmd "--target=$source" }
-    lappend pcmd $::tmpfile
-    if {[catch {set ::pw_record_pid [exec {*}$pcmd &]} err]} {
-        logsys err "failed to start pw-record: $err"; finish 1; return
+    # Both recorders drain their capture buffer and finalise the WAV header on
+    # SIGTERM, which stop_recording relies on (parecord discarded ~2s of buffer,
+    # losing the tail of every recording). For sox, --input-buffer 3200 caps the
+    # tail at 0.1s of audio (16kHz mono s16); the pulse default buffered ~2s.
+    switch -- [resolve_recorder] {
+        sox {
+            set atype [expr {$::MACOS ? "coreaudio" : "pulseaudio"}]
+            if {$source eq ""} { set source default }
+            set pcmd [list sox -q --input-buffer 3200 -t $atype $source \
+                          -r 16000 -c 1 -b 16 -e signed-integer $::tmpfile]
+        }
+        pw-record {
+            set pcmd [list pw-record --rate=16000 --channels=1 --format=s16]
+            if {$source ne ""} { lappend pcmd "--target=$source" }
+            lappend pcmd $::tmpfile
+        }
+        default {
+            logsys err "no recorder found: install sox (or pw-record on Linux)"
+            finish 1; return
+        }
     }
-    set ::poll_id [after 200 poll_pw_record]
+    if {[catch {set ::recorder_pid [exec {*}$pcmd &]} err]} {
+        logsys err "failed to start [lindex $pcmd 0]: $err"; finish 1; return
+    }
+    set ::poll_id [after 200 poll_recorder]
     set ::auto_stop_id [after [expr {$::TIMEOUT_S * 1000}] stop_recording]
 }
 
@@ -990,13 +1049,13 @@ proc handle_client {sock _addr _port} {
         stop  { puts $sock "OK"; after idle stop_recording }
         pause {
             if {$::state eq "paused"} { puts $sock "ACK already-paused" } \
-            elseif {$::pw_record_pid > 0 && ![catch {exec kill -STOP $::pw_record_pid}]} {
+            elseif {$::recorder_pid > 0 && ![catch {exec kill -STOP $::recorder_pid}]} {
                 set ::state paused; stop_animate; draw_icon [recording_frac] recording 1; puts $sock "OK"
             } else { puts $sock "ACK pause-failed" }
         }
         resume {
             if {$::state ne "paused"} { puts $sock "ACK not-paused" } \
-            elseif {$::pw_record_pid > 0 && ![catch {exec kill -CONT $::pw_record_pid}]} {
+            elseif {$::recorder_pid > 0 && ![catch {exec kill -CONT $::recorder_pid}]} {
                 enter_state recording; puts $sock "OK"
             } else { puts $sock "ACK resume-failed" }
         }
@@ -1008,9 +1067,9 @@ proc handle_client {sock _addr _port} {
 proc stop_recording {} {
     stop_listener
     if {$::auto_stop_id ne ""} { after cancel $::auto_stop_id; set ::auto_stop_id "" }
-    if {$::pw_record_pid > 0} {
-        if {$::state eq "paused"} { catch {exec kill -CONT $::pw_record_pid} }
-        catch {exec kill $::pw_record_pid}
+    if {$::recorder_pid > 0} {
+        if {$::state eq "paused"} { catch {exec kill -CONT $::recorder_pid} }
+        catch {exec kill $::recorder_pid}
     }
     if {$::state ne "transcribing"} { enter_state transcribing }
 }
@@ -1063,12 +1122,16 @@ proc run_self_test {} {
     if {[dict size $::ukmap] > 0} { check "dictionary colour" {[britishize "color"] eq "colour"} }
     set ::DIALECT off
 
-    set acts [build_inject_actions "ab cd"]
-    check "inject types words" {[string match "*type ab*" $acts] && [string match "*type cd*" $acts]}
-    check "inject ibus for curly" {[string match "*ctrl+shift+u*" [build_inject_actions "x’y"]]}
-
-    check "paste key" {$::PASTE_KEY eq "key ctrl+v"}
-    check "enter key" {$::ENTER_KEY eq "key enter"}
+    if {$::MACOS} {
+        check "applescript quote escapes" {[applescript_quote "a\"b\\c\nd"] eq "\"a\\\"b\\\\c\\nd\""}
+    } else {
+        set acts [build_inject_actions "ab cd"]
+        check "inject types words" {[string match "*type ab*" $acts] && [string match "*type cd*" $acts]}
+        check "inject ibus for curly" {[string match "*ctrl+shift+u*" [build_inject_actions "x’y"]]}
+        check "paste key" {$::PASTE_KEY eq "key ctrl+v"}
+        check "enter key" {$::ENTER_KEY eq "key enter"}
+    }
+    if {![catch {exec which sox}]} { check "recorder prefers sox" {[resolve_recorder] eq "sox"} }
 
     set _toml [parse_toml "default_provider = \"x\"\n# a comment\n\[provider.x\]\napi_key = \"k\"\nmodel = 'm'  # inline\n"]
     check "toml default_provider" {[dict get $_toml "" default_provider] eq "x"}
@@ -1098,8 +1161,11 @@ proc run_self_test {} {
     set ::DELIVER clipboard
     if {![catch {set_clipboard "round-trip-probe"}]} {
         set back ""
-        if {[clip_backend] eq "x11"} { catch {set back [exec xclip -selection clipboard -o]} } \
-        else                         { catch {set back [exec wl-paste -n]} }
+        switch -- [clip_backend] {
+            macos   { catch {set back [exec pbpaste]} }
+            wayland { catch {set back [exec wl-paste -n]} }
+            x11     { catch {set back [exec xclip -selection clipboard -o]} }
+        }
         check "clipboard round-trip" {$back eq "round-trip-probe"}
     }
 

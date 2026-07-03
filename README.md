@@ -23,18 +23,19 @@ review pane are simply absent.
 
 ## Install
 
-Homebrew (Linux; the macOS port is incomplete):
+Homebrew (Linux and macOS):
 
 ```
 brew tap overseers-desk/od
 brew install scribe
 ```
 
-The formula installs scribe and Tcl/Tk only; it does not pull the mic-path
-runtime commands. For `--input mic`, install whisper.cpp separately
+On macOS the formula pulls `sox` for audio capture; keystrokes and clipboard go
+through the system's own `osascript` and `pbcopy`. On Linux the formula installs
+scribe and Tcl/Tk only. For `--input mic`, install whisper.cpp separately
 (`brew install whisper-cpp` provides `whisper-cli`) and supply a whisper model
-file such as `ggml-medium.en.bin`. `pw-record` and `dotool` must also be on
-`PATH` (see Dependencies below).
+file such as `ggml-medium.en.bin`. On Linux, a recorder (`sox` or `pw-record`)
+and `dotool` must also be on `PATH` (see Dependencies below).
 
 ## Dependencies
 
@@ -43,8 +44,15 @@ Runtime commands (must be on `PATH`):
 | Command | Provides | Needed for |
 |---------|----------|------------|
 | `whisper-cli` | speech-to-text (whisper.cpp) | `--input mic` |
-| `pw-record` | audio capture (PipeWire) | `--input mic` |
-| `dotool` | keystroke injection via uinput | `--deliver type`, and the paste keystroke |
+| `sox` | audio capture (preferred; pulseaudio backend on Linux, coreaudio on macOS) | `--input mic` |
+| `pw-record` | audio capture (PipeWire; Linux fallback when sox is absent) | `--input mic` |
+| `dotool` | keystroke injection via uinput (Linux) | `--deliver type`, and the paste keystroke |
+
+On macOS, keystrokes go through `osascript` (System Events) and the clipboard
+through `pbcopy`/`pbpaste`, both of which ship with the OS. Grant the app that
+launches scribe (e.g. your terminal) **Accessibility** permission for
+typing/pasting and **Microphone** permission for recording, under System
+Settings → Privacy & Security.
 
 Other requirements:
 

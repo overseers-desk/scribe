@@ -8,7 +8,7 @@ package require Tk 9
 #   --input  mic | clipboard               where the text comes from
 #   --window | --no-window                 review window, or unattended
 #   --deliver type | paste | clipboard     how the result leaves
-#   --style[=NAME]                         apply a style pass (omit = raw)
+#   --style                                (no-window) style the text; a window always offers styling
 #   --quotes double|single|straight  --dialect off|british   normalisation
 #
 # Legacy tools are presets:
@@ -39,6 +39,7 @@ set ::DEEPSEEK_CONFIG  [file join $::APP_DIR "deepseek.json"]
 set ::STYLES_DIR       [file join $::APP_DIR "styles"]
 set ::SYSTEM_PROMPTS   [file join $::APP_DIR "system-prompts.yaml"]
 set ::CONFIG_FILE      [file join $::APP_DIR "current-mode.conf"]
+set ::STATE_STYLE_FILE [file join [expr {[info exists ::env(XDG_STATE_HOME)] && $::env(XDG_STATE_HOME) ne "" ? $::env(XDG_STATE_HOME) : "$::env(HOME)/.local/state"}] scribe style]
 set ::DIALECT_FILE     [file join $::APP_DIR "dialect-us-to-british.tsv"]
 set ::LOG_DIR          /var/local/log/dictation
 set ::CACHE_DIR        [file join [expr {[info exists ::env(XDG_CACHE_HOME)] && $::env(XDG_CACHE_HOME) ne "" ? $::env(XDG_CACHE_HOME) : "$::env(HOME)/.cache"}] scribe]
@@ -175,7 +176,7 @@ for {set i 0} {$i < [llength $::argv]} {incr i} {
             puts "  --input mic|clipboard          source (required with --no-window)"
             puts "  --window | --no-window         draw the review window, or run unattended"
             puts "  --deliver type|paste|clipboard how the result leaves (default paste)"
-            puts "  --style\[=NAME\]                 apply a style pass (needs a configured AI provider)"
+            puts "  --style                        (no-window) style the text; a window offers styling whenever a provider is configured"
             puts "  --provider NAME                use \[provider.NAME\] from config.toml (else default_provider)"
             puts "  --auto-style-delay MS          (window) auto-style after MS ms; 1 = immediate"
             puts "  --quotes double|single|straight   double: “ ” · single: ‘ ’ · straight: ASCII"
@@ -313,9 +314,13 @@ proc loadSystemPrompts {} {
 proc loadStyle {} {
     set name $::STYLE_NAME
     if {$name eq ""} {
-        set name "clear"
-        if {[file exists $::CONFIG_FILE]} {
-            catch { set f [open $::CONFIG_FILE r]; set name [string trim [read $f]]; close $f }
+        # The window's own persisted pick wins; a mode-switcher default in
+        # current-mode.conf applies when no state file exists; else "clear".
+        foreach src [list $::STATE_STYLE_FILE $::CONFIG_FILE] {
+            if {$name ne ""} break
+            if {[file exists $src]} {
+                catch { set f [open $src r]; set name [string trim [read $f]]; close $f }
+            }
         }
         if {$name eq ""} { set name "clear" }
     }
@@ -328,6 +333,31 @@ proc loadStyle {} {
     set f [open $path r]; set ::styleGuide [read $f]; close $f
     set ::STYLE_NAME $name
     dbg "style = $name"
+}
+
+# Style names available to the picker: the basename of every styles/*.txt.
+proc styleNames {} {
+    set names {}
+    foreach p [lsort [glob -nocomplain -directory $::STYLES_DIR *.txt]] {
+        lappend names [file rootname [file tail $p]]
+    }
+    return $names
+}
+
+# Persist the window's style pick to the XDG state file (bare name, one line),
+# separate from current-mode.conf so the external mode-switcher stays sole writer.
+proc saveStyleChoice {name} {
+    catch {
+        file mkdir [file dirname $::STATE_STYLE_FILE]
+        set f [open $::STATE_STYLE_FILE w]; puts -nonewline $f $name; close $f
+    }
+}
+
+# The style combobox set ::STYLE_NAME via -textvariable; reload the guide for it
+# and persist the pick. The pass itself runs only on a Style click.
+proc on_style_change {} {
+    loadStyle
+    saveStyleChoice $::STYLE_NAME
 }
 
 #==============================================================================
@@ -697,7 +727,12 @@ proc build_review_ui {} {
 
     if {$styleable} {
         pack [ttk::frame .pane2 -padding 6] -fill both -expand 1
-        pack [ttk::label .pane2.lbl -text "Styled ($::STYLE_NAME)"] -anchor w
+        pack [ttk::frame .pane2.hdr] -anchor w -fill x
+        pack [ttk::label .pane2.hdr.lbl -text "Styled"] -side left
+        ttk::combobox .pane2.hdr.style -state readonly -width 12 \
+            -values [styleNames] -textvariable ::STYLE_NAME -takefocus 0
+        bind .pane2.hdr.style <<ComboboxSelected>> {on_style_change; focus .}
+        pack .pane2.hdr.style -side left -padx 6
         text .pane2.txt -height 8 -width 80 -wrap word -relief solid -borderwidth 2 -takefocus 0
         pack .pane2.txt -fill both -expand 1
         bind .pane2.txt <Button-1> {setActiveArea 2; focus .; break}
@@ -707,7 +742,7 @@ proc build_review_ui {} {
     pack [ttk::frame .btns -padding 6] -fill x
     ttk::button .btns.go -text "$primary  (Space; Enter = + ↵)" -command {deliver_now [active_text] 0} -takefocus 0
     pack .btns.go -side left -padx 4
-    if {$styleable && $::STYLE_ON} {
+    if {$styleable} {
         ttk::button .btns.style -text "Style" -command {run_rewrite} -takefocus 0
         pack .btns.style -side left -padx 4
     }
@@ -725,7 +760,7 @@ proc build_review_ui {} {
     .pane1.txt insert 1.0 $::sourceText
     .pane1.txt configure -state disabled
     if {$styleable} {
-        if {!$::STYLE_ON} { paneRewriteStatus "(no style pass — pass --style to enable)" }
+        if {!$::STYLE_ON} { paneRewriteStatus "Press Style to rewrite in the selected style." }
         .pane2.txt configure -state disabled
     }
 
@@ -1181,15 +1216,30 @@ proc run_self_test {} {
         check "clipboard round-trip" {$back eq "round-trip-probe"}
     }
 
-    set ::STYLE_ON 1; set ::INPUT mic; set ::STYLE_NAME "clear"; set ::DELIVER paste
+    set ::STYLE_ON 0; set ::INPUT mic; set ::STYLE_NAME "clear"; set ::DELIVER paste
     if {![catch {build_review_ui} e]} {
         set ok [expr {[winfo exists .pane1.txt] && [winfo exists .btns.go]}]
         if {$::AI_AVAILABLE} {
-            check "review UI builds (styled pane present)" {$ok && [winfo exists .pane2.txt] && [winfo exists .btns.style] && ![winfo exists .tip]}
+            check "review UI builds (style controls present without --style)" \
+                {$ok && [winfo exists .pane2.txt] && [winfo exists .btns.style] && [winfo exists .pane2.hdr.style] && ![winfo exists .tip]}
         } else {
             check "review UI builds (dictation only, tip explains no AI)" {$ok && ![winfo exists .pane2.txt] && ![winfo exists .btns.style] && [winfo exists .tip]}
         }
     } else { check "review UI builds" 0 "($e)" }
+
+    # Style picker: setting ::STYLE_NAME + on_style_change reloads the guide and
+    # persists the pick, against a scratch state file so the real one is untouched.
+    set _saveState $::STATE_STYLE_FILE
+    set ::STATE_STYLE_FILE [file join "/tmp" "scribe-selftest-[pid].style"]
+    set _other [lindex [styleNames] end]
+    set ::STYLE_NAME $_other; set ::styleGuide ""
+    on_style_change
+    set _persisted ""
+    catch { set _fh [open $::STATE_STYLE_FILE r]; set _persisted [string trim [read $_fh]]; close $_fh }
+    check "style picker reloads guide and persists pick" \
+        {[string length $::styleGuide] > 0 && $::STYLE_NAME eq $_other && $_persisted eq $_other}
+    catch {file delete $::STATE_STYLE_FILE}
+    set ::STATE_STYLE_FILE $_saveState
 
     puts [expr {$fail ? "SELF-TEST: FAIL" : "SELF-TEST: PASS"}]
     exit $fail
@@ -1224,7 +1274,10 @@ if {$::STYLE_ON && !$::AI_AVAILABLE} {
     logsys notice "no AI provider configured — style pass disabled; running as dictation"
     set ::STYLE_ON 0
 }
-if {$::STYLE_ON} { loadStyle; loadSystemPrompts }
+# In a window the Style button is always offered when a provider is configured,
+# so load the guide and prompts whenever the feature is reachable; --no-window
+# needs them only when --style forces the pass.
+if {$::AI_AVAILABLE && ($::WINDOW || $::STYLE_ON)} { loadStyle; loadSystemPrompts }
 
 if {$::SELF_TEST} { after idle run_self_test; vwait forever }
 if {$::TEST_TEXT ne ""} { after idle [list on_source_ready $::TEST_TEXT]; vwait forever }

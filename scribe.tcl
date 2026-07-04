@@ -714,6 +714,14 @@ proc build_review_ui {} {
     ttk::button .btns.copy -text "Copy to clipboard" -command {set_clipboard [active_text]; finish 0} -takefocus 0
     pack .btns.copy -side left -padx 4
 
+    # With no AI provider the Style control is absent; a muted footer tip says why
+    # and how to enable it, so its absence reads as configuration, not a fault.
+    if {!$styleable} {
+        pack [ttk::label .tip -anchor w -justify left -foreground "#666666" -wraplength 520 \
+            -text "No AI provider configured, so styling is unavailable. Add a provider in config.toml to enable the style pass."] \
+            -fill x -padx 10 -pady {0 6}
+    }
+
     .pane1.txt insert 1.0 $::sourceText
     .pane1.txt configure -state disabled
     if {$styleable} {
@@ -1177,9 +1185,9 @@ proc run_self_test {} {
     if {![catch {build_review_ui} e]} {
         set ok [expr {[winfo exists .pane1.txt] && [winfo exists .btns.go]}]
         if {$::AI_AVAILABLE} {
-            check "review UI builds (styled pane present)" {$ok && [winfo exists .pane2.txt] && [winfo exists .btns.style]}
+            check "review UI builds (styled pane present)" {$ok && [winfo exists .pane2.txt] && [winfo exists .btns.style] && ![winfo exists .tip]}
         } else {
-            check "review UI builds (dictation only, no styled pane)" {$ok && ![winfo exists .pane2.txt] && ![winfo exists .btns.style]}
+            check "review UI builds (dictation only, tip explains no AI)" {$ok && ![winfo exists .pane2.txt] && ![winfo exists .btns.style] && [winfo exists .tip]}
         }
     } else { check "review UI builds" 0 "($e)" }
 

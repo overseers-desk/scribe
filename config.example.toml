@@ -27,3 +27,22 @@ api_base = "https://api.anthropic.com"
 api_key  = "sk-..."
 model    = "gpt-4o"
 api_base = "https://api.openai.com/v1"
+
+# Local model (Ollama, llama.cpp's llama-server, LM Studio, vLLM, ...). A machine
+# with the GPU to run whisper for dictation can usually run a small model for the
+# style pass too: no API key, no per-request cost, nothing leaves the machine.
+#
+# api_base is everything before /chat/completions, so it must include the path
+# prefix the local server mounts its OpenAI API under (Ollama and llama.cpp use
+# /v1). api_key is ignored by the server but must be present and non-empty, since
+# a section with no api_key counts as unconfigured. The model must already be
+# pulled (ollama pull qwen2.5:14b).
+#
+# qwen2.5:14b has no "thinking" mode, so it returns a clean one-shot rewrite;
+# qwen3:8b is smaller and fits an 8 GB card, but emits reasoning unless thinking
+# is disabled. Pair a local provider with --auto-style-delay 1 for immediate
+# styling with no review gap (there is no per-request cost to pause for).
+[provider.ollama]
+api_key  = "ollama"
+model    = "qwen2.5:14b"
+api_base = "http://localhost:11434/v1"

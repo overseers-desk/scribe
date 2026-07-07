@@ -1,19 +1,20 @@
 #!/usr/bin/env wish9.0
 package require Tk 9
 
-# Scribe — take dictation or clipboard text, optionally restyle it, and deliver
-# it by typing, pasting, or leaving it on the clipboard.
+# Scribe — take text you type, dictate, or hold on the clipboard, optionally
+# restyle it, and deliver it by typing, pasting, or leaving it on the clipboard.
 #
 # Behaviour is five independent axes; reading the flags tells the whole story:
-#   --input  mic | clipboard               where the text comes from
+#   --input  keyboard | voice | clipboard  where the text comes from (default keyboard)
 #   --window | --no-window                 review window, or unattended
 #   --deliver type | paste | clipboard     how the result leaves
 #   --style                                (no-window) style the text; a window always offers styling
 #   --quotes double|single|straight  --dialect off|british   normalisation
 #
-# Legacy tools are presets:
-#   dictate            : --input mic --no-window --deliver type
-#   dictate-stylist    : --input mic --window --style --auto-style-delay 1000 --deliver paste
+# With no --input, scribe opens an empty editable window and waits for you to
+# type. Legacy tools are presets:
+#   dictate            : --input voice --no-window --deliver type
+#   dictate-stylist    : --input voice --window --style --auto-style-delay 1000 --deliver paste
 #   language-stylist   : --input clipboard --window --style --auto-style-delay 1 --deliver clipboard
 #
 # Bind presets to GNOME custom shortcuts launching the custom Wayland wish with
@@ -50,7 +51,7 @@ set ::APPNAME          "scribe-[pid]"
 set ::MACOS            [expr {$::tcl_platform(os) eq "Darwin"}]
 
 # --- axes ---
-set ::INPUT            ""          ;# mic | clipboard
+set ::INPUT            ""          ;# keyboard | voice | clipboard ("" -> keyboard)
 set ::WINDOW           1
 set ::DELIVER          paste       ;# type | paste | clipboard
 set ::STYLE_ON         0
@@ -173,7 +174,7 @@ for {set i 0} {$i < [llength $::argv]} {incr i} {
         -v - --version { puts "scribe $::VERSION"; exit 0 }
         -h - --help {
             puts "Usage: scribe \[options\]"
-            puts "  --input mic|clipboard          source (required with --no-window)"
+            puts "  --input keyboard|voice|clipboard  source (default keyboard; --no-window needs voice|clipboard)"
             puts "  --window | --no-window         draw the review window, or run unattended"
             puts "  --deliver type|paste|clipboard how the result leaves (default paste)"
             puts "  --style                        (no-window) style the text; a window offers styling whenever a provider is configured"
@@ -181,7 +182,7 @@ for {set i 0} {$i < [llength $::argv]} {incr i} {
             puts "  --auto-style-delay MS          (window) auto-style after MS ms; 1 = immediate"
             puts "  --quotes double|single|straight   double: “ ” · single: ‘ ’ · straight: ASCII"
             puts "  --dialect off|british          british: US→UK spelling; default quotes -> single"
-            puts "  mic: -m -l -t -to -c --prompt|--prompt-file --key-delay --word-delay -nf -ng -fa -ps"
+            puts "  voice: -m -l -t -to -c --prompt|--prompt-file --key-delay --word-delay -nf -ng -fa -ps"
             puts "  --cmd stop|status|pause|resume  --self-test --test-text S --test-file WAV"
             puts "  --debug                        keep the recording; write a replay .sh of the whisper-cli call"
             exit 0
@@ -506,8 +507,11 @@ proc run_rewrite {} {
         http::register https 443 ::tls::socket
     }
 
+    # Style what is currently in the source pane (the user may have edited the
+    # transcription/clipboard text); fall back to the variable when windowless.
+    set src [expr {[winfo exists .pane1.txt] ? [string trim [.pane1.txt get 1.0 end]] : $::sourceText}]
     set systemPrompt "${::singlePassPrefix}\n${::styleGuide}"
-    set wrappedText  "${::userTextPrefix}${::sourceText}\n"
+    set wrappedText  "${::userTextPrefix}${src}\n"
     set payload [encoding convertto utf-8 [buildJSONPayload $::apiModel $systemPrompt $wrappedText]]
     set headers [list Authorization "Bearer $::apiKey" Content-Type "application/json; charset=utf-8"]
     if {[catch {
@@ -582,7 +586,14 @@ proc set_clipboard {txt} {
         }
     }
 }
-proc active_text {} { return [expr {$::activeArea == 2 ? $::rewriteText : $::sourceText}] }
+# The panes are editable, so the widget is the source of truth once it exists;
+# fall back to the variables for the windowless path and for self-test checks
+# that run before the window is built.
+proc active_text {} {
+    set w [expr {$::activeArea == 2 ? ".pane2.txt" : ".pane1.txt"}]
+    if {[winfo exists $w]} { return [string trim [$w get 1.0 end]] }
+    return [expr {$::activeArea == 2 ? $::rewriteText : $::sourceText}]
+}
 
 # dotool actions to type TEXT, two-rate cadence + IBus Ctrl+Shift+U for
 # non-ASCII (curly quotes, accented proper nouns). From the companion tool.
@@ -714,7 +725,7 @@ set ::PANE_BG  "#ffffff"
 
 proc build_review_ui {} {
     wm title . "Scribe"
-    set srcLabel [expr {$::INPUT eq "clipboard" ? "Clipboard" : "Dictated"}]
+    set srcLabel [expr {$::INPUT eq "clipboard" ? "Clipboard" : ($::INPUT eq "voice" ? "Dictated" : "Text")}]
     # The styled pane and its controls exist only when an AI provider is
     # configured; with none, scribe shows a single dictation pane (see CLAUDE.md).
     set styleable $::AI_AVAILABLE
@@ -723,7 +734,7 @@ proc build_review_ui {} {
     pack [ttk::label .pane1.lbl -text $srcLabel] -anchor w
     text .pane1.txt -height 8 -width 80 -wrap word -relief solid -borderwidth 2 -takefocus 0
     pack .pane1.txt -fill both -expand 1
-    bind .pane1.txt <Button-1> {setActiveArea 1; focus .; break}
+    bind .pane1.txt <Button-1> {setActiveArea 1}
 
     if {$styleable} {
         pack [ttk::frame .pane2 -padding 6] -fill both -expand 1
@@ -735,12 +746,12 @@ proc build_review_ui {} {
         pack .pane2.hdr.style -side left -padx 6
         text .pane2.txt -height 8 -width 80 -wrap word -relief solid -borderwidth 2 -takefocus 0
         pack .pane2.txt -fill both -expand 1
-        bind .pane2.txt <Button-1> {setActiveArea 2; focus .; break}
+        bind .pane2.txt <Button-1> {setActiveArea 2}
     }
 
     set primary [expr {$::DELIVER eq "type" ? "Type" : ($::DELIVER eq "clipboard" ? "Copy" : "Paste")}]
     pack [ttk::frame .btns -padding 6] -fill x
-    ttk::button .btns.go -text "$primary  (Space; Enter = + ↵)" -command {deliver_now [active_text] 0} -takefocus 0
+    ttk::button .btns.go -text "$primary  (Space · Ctrl+↵ while editing)" -command {deliver_now [active_text] 0} -takefocus 0
     pack .btns.go -side left -padx 4
     if {$styleable} {
         ttk::button .btns.style -text "Style" -command {run_rewrite} -takefocus 0
@@ -758,28 +769,36 @@ proc build_review_ui {} {
     }
 
     .pane1.txt insert 1.0 $::sourceText
-    .pane1.txt configure -state disabled
     if {$styleable} {
         if {!$::STYLE_ON} { paneRewriteStatus "Press Style to rewrite in the selected style." }
-        .pane2.txt configure -state disabled
     }
 
-    bind . <space>  {deliver_now [active_text] 0; break}
-    bind . <Return> {deliver_now [active_text] 1; break}
-    bind . <Escape> {finish 0; break}
+    # Focus-dependent keys: when a text pane holds focus the Text class inserts the
+    # character first (bindtags: {.paneN.txt Text . all}) and the guarded toplevel
+    # binding no-ops, so Space/Enter type. When focus is on the toplevel (pre-filled
+    # voice/clipboard modes) they deliver, as before. Ctrl+Enter always delivers.
+    bind . <space>          {if {![typing_focus]} {deliver_now [active_text] 0; break}}
+    bind . <Return>         {if {![typing_focus]} {deliver_now [active_text] 1; break}}
+    bind . <Control-Return> {deliver_now [active_text] 0; break}
+    bind . <Escape>         {finish 0; break}
     if {$styleable} {
-        bind . <Up>   {setActiveArea 1; break}
-        bind . <Down> {setActiveArea 2; break}
+        bind . <Up>   {if {![typing_focus]} {setActiveArea 1; break}}
+        bind . <Down> {if {![typing_focus]} {setActiveArea 2; break}}
     }
     wm protocol . WM_DELETE_WINDOW {set_clipboard [active_text]; finish 0}
     refresh_highlight
 }
 proc paneSetRewrite {txt} {
     if {![winfo exists .pane2.txt]} return
-    .pane2.txt configure -state normal; .pane2.txt delete 1.0 end
-    .pane2.txt insert 1.0 $txt; .pane2.txt configure -state disabled
+    .pane2.txt delete 1.0 end; .pane2.txt insert 1.0 $txt
 }
 proc paneRewriteStatus {msg} { paneSetRewrite $msg }
+# True when an editable text pane holds keyboard focus, so Space/Enter should type
+# rather than deliver. [focus] is "" on a backgrounded/unmapped window — guard it.
+proc typing_focus {} {
+    set w [focus]
+    expr {$w ne "" && [winfo exists $w] && [winfo class $w] eq "Text"}
+}
 proc setActiveArea {n} { set ::activeArea $n; refresh_highlight }
 proc refresh_highlight {} {
     if {![winfo exists .pane1.txt]} return
@@ -799,9 +818,17 @@ proc on_source_ready {text} {
     catch {tk systray destroy}
     if {$::WINDOW} {
         build_review_ui
-        wm deiconify .; raise .; focus -force .
-        after 120 {catch {focus -force .}}
-        if {$::STYLE_ON && $::STYLE_AUTO ne ""} { set ::autosend_id [after $::STYLE_AUTO run_rewrite] }
+        wm deiconify .; raise .
+        # Empty source (keyboard mode): put the cursor in the pane so the user can
+        # type. Pre-filled (voice/clipboard): keep focus on the toplevel so Space
+        # delivers, and re-assert it against the WM's post-map focus.
+        if {$::sourceText eq ""} {
+            focus .pane1.txt
+        } else {
+            focus -force .
+            after 120 {catch {focus -force .}}
+        }
+        if {$::STYLE_ON && $::STYLE_AUTO ne "" && $::sourceText ne ""} { set ::autosend_id [after $::STYLE_AUTO run_rewrite] }
     } else {
         if {$::STYLE_ON} { run_rewrite } else { deliver_now $::sourceText }
     }
@@ -889,7 +916,7 @@ proc stop_animate {}  { if {$::anim_id ne ""} { after cancel $::anim_id; set ::a
 proc enter_state {newstate} { stop_animate; set ::state $newstate; set ::blink 1; start_animate }
 
 #==============================================================================
-# MIC INPUT
+# VOICE INPUT
 #==============================================================================
 
 proc resolve_source {capture} {
@@ -1062,7 +1089,7 @@ proc start_recording {} {
 }
 
 #==============================================================================
-# SECOND-PRESS SOCKET (mic): stop / status / pause / resume
+# SECOND-PRESS SOCKET (voice): stop / status / pause / resume
 #==============================================================================
 
 proc probe_running {cmd} {
@@ -1189,6 +1216,7 @@ proc run_self_test {} {
     check "active=source pane1" {[active_text] eq "src"}
     setActiveArea 2
     check "active=rewrite pane2" {[active_text] eq "rw"}
+    check "typing_focus null-safe when nothing focused" {[typing_focus] == 0}
 
     set ::WINDOW 1; set ::SELF_TEST 1; set ::QSTYLE double
     if {$::AI_AVAILABLE} {
@@ -1216,7 +1244,7 @@ proc run_self_test {} {
         check "clipboard round-trip" {$back eq "round-trip-probe"}
     }
 
-    set ::STYLE_ON 0; set ::INPUT mic; set ::STYLE_NAME "clear"; set ::DELIVER paste
+    set ::STYLE_ON 0; set ::INPUT voice; set ::STYLE_NAME "clear"; set ::DELIVER paste
     if {![catch {build_review_ui} e]} {
         set ok [expr {[winfo exists .pane1.txt] && [winfo exists .btns.go]}]
         if {$::AI_AVAILABLE} {
@@ -1226,6 +1254,14 @@ proc run_self_test {} {
             check "review UI builds (dictation only, tip explains no AI)" {$ok && ![winfo exists .pane2.txt] && ![winfo exists .btns.style] && [winfo exists .tip]}
         }
     } else { check "review UI builds" 0 "($e)" }
+
+    # Panes are an editable workspace, and delivery/styling read the live widget.
+    if {[winfo exists .pane1.txt]} {
+        check "source pane editable" {[.pane1.txt cget -state] eq "normal"}
+        .pane1.txt delete 1.0 end; .pane1.txt insert 1.0 "hello"; setActiveArea 1
+        check "active_text reads edited pane" {[active_text] eq "hello"}
+        if {[winfo exists .pane2.txt]} { check "styled pane editable" {[.pane2.txt cget -state] eq "normal"} }
+    }
 
     # Style picker: setting ::STYLE_NAME + on_style_change reloads the guide and
     # persists the pick, against a scratch state file so the real one is untouched.
@@ -1251,13 +1287,13 @@ proc run_self_test {} {
 
 wm withdraw .
 
-if {$::INPUT ni {mic clipboard ""}} { fatal "--input must be mic or clipboard" }
+if {$::INPUT ni {keyboard voice clipboard ""}} { fatal "--input must be keyboard, voice, or clipboard" }
 if {$::DELIVER ni {type paste clipboard}} { fatal "--deliver must be type, paste, or clipboard" }
 if {$::QUOTES ni {"" double single straight}} { fatal "--quotes must be double, single, or straight" }
 if {$::DIALECT ni {off british}} { fatal "--dialect must be off or british" }
 if {$::STYLE_AUTO ne "" && ![string is integer -strict $::STYLE_AUTO]} { fatal "--auto-style-delay must be an integer (ms)" }
-if {!$::WINDOW && $::INPUT eq ""} { fatal "--no-window requires --input mic|clipboard" }
-if {$::INPUT eq ""} { set ::INPUT mic }
+if {$::INPUT eq ""} { set ::INPUT keyboard }
+if {!$::WINDOW && $::INPUT eq "keyboard"} { fatal "--no-window requires --input voice|clipboard" }
 
 # Resolve quote style: explicit --quotes wins; else british -> single; else double.
 if {$::QUOTES ne ""} {
@@ -1290,7 +1326,10 @@ if {$::TEST_FILE ne ""} {
 
 if {$::INPUT eq "clipboard"} { after idle acquire_clipboard; vwait forever }
 
-# Mic. A second press reaches the running recorder over the socket.
+# Keyboard (default): open an empty editable window and wait for the user to type.
+if {$::INPUT eq "keyboard"} { after idle [list on_source_ready ""]; vwait forever }
+
+# Voice. A second press reaches the running recorder over the socket.
 probe_running $::CMD
 serve_listener
 start_recording

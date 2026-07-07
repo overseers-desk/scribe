@@ -1,14 +1,14 @@
 # Scribe
 
-A hotkey-invoked desktop tool that takes text from your voice or your clipboard,
-optionally restyles it with an LLM, and delivers it by typing, pasting, or
-leaving it on the clipboard.
+A hotkey-invoked desktop tool that takes text you type, dictate, or hold on the
+clipboard, optionally restyles it with an LLM, and delivers it by typing,
+pasting, or leaving it on the clipboard.
 
 Its behaviour is five independent flags, so the command line states exactly what
 will happen:
 
 ```
---input mic|clipboard            where the text comes from
+--input keyboard|voice|clipboard where the text comes from (default keyboard)
 --window | --no-window           show a review window, or run unattended
 --deliver type|paste|clipboard   how the result leaves
 --style[=NAME]                   apply a style pass (needs a configured AI provider)
@@ -32,7 +32,7 @@ brew install scribe
 
 On macOS the formula pulls `sox` for audio capture; keystrokes and clipboard go
 through the system's own `osascript` and `pbcopy`. On Linux the formula installs
-scribe and Tcl/Tk only. For `--input mic`, install whisper.cpp separately
+scribe and Tcl/Tk only. For `--input voice`, install whisper.cpp separately
 (`brew install whisper-cpp` provides `whisper-cli`) and supply a whisper model
 file such as `ggml-medium.en.bin`. On Linux, a recorder (`pw-record`, or `sox`
 as fallback) and `dotool` must also be on `PATH` (see Dependencies below).
@@ -43,9 +43,9 @@ Runtime commands (must be on `PATH`):
 
 | Command | Provides | Needed for |
 |---------|----------|------------|
-| `whisper-cli` | speech-to-text (whisper.cpp) | `--input mic` |
-| `pw-record` | audio capture (PipeWire; preferred on Linux) | `--input mic` |
-| `sox` | audio capture (macOS via coreaudio; Linux fallback when pw-record is absent) | `--input mic` |
+| `whisper-cli` | speech-to-text (whisper.cpp) | `--input voice` |
+| `pw-record` | audio capture (PipeWire; preferred on Linux) | `--input voice` |
+| `sox` | audio capture (macOS via coreaudio; Linux fallback when pw-record is absent) | `--input voice` |
 | `dotool` | keystroke injection via uinput (Linux) | `--deliver type`, and the paste keystroke |
 
 On macOS, keystrokes go through `osascript` (System Events) and the clipboard
@@ -61,7 +61,7 @@ Other requirements:
   Ubuntu those were provided by tcllib. With OS X brew they came with tcl9.
 
 - A **whisper model** file (for example `ggml-medium.en.bin`), passed with
-  `--model`, for `--input mic`.
+  `--model`, for `--input voice`.
 
 - An **AI provider** in `config.toml`, only for `--style` (optional; see below).
 - `dotool` needs access to `/dev/uinput` (typically membership of the `input`
@@ -89,13 +89,13 @@ Other requirements:
 2. Bind the presets you want to global shortcuts (GNOME custom keyboard
    shortcuts, or your desktop's equivalent).
 
-   A second press of a `--input mic` shortcut stops the recording started by the first.
+   A second press of a `--input voice` shortcut stops the recording started by the first.
 
    For example, to bind dictation to the `Insert` key under GNOME, add a custom
    keybinding whose command is:
 
    ```
-     code/scribe/scribe.tcl --input mic --deliver paste --dialect british \
+     code/scribe/scribe.tcl --input voice --deliver paste --dialect british \
      --timeout 300 --window --model code/whisper.cpp/models/ggml-medium.en.bin \
      --prompt-file ~/.whisper-prompt-file
    ```
@@ -113,18 +113,27 @@ Other requirements:
 
 | Goal | Command |
 |------|---------|
-| Dictate straight into the focused window | `scribe.tcl --input mic --no-window --deliver type` |
-| Dictate, review, then paste | `scribe.tcl --input mic --window --style --auto-style-delay 1000 --deliver paste` |
+| Dictate straight into the focused window | `scribe.tcl --input voice --no-window --deliver type` |
+| Dictate, review, then paste | `scribe.tcl --input voice --window --style --auto-style-delay 1000 --deliver paste` |
 | Restyle the clipboard, review, copy back | `scribe.tcl --input clipboard --window --style --auto-style-delay 1 --deliver clipboard` |
 
-`--no-window` requires `--input`. With `--window`, `--input` defaults to `mic`.
+With no `--input`, scribe defaults to `keyboard`: it opens an empty window for you
+to type into. `--no-window` needs `--input voice` or `--input clipboard`, since
+there is nothing to type into without a window.
 
 ## Review window
 
 When a window is shown it has two panes, the source text and the styled text,
-with one highlighted. Up and Down (or a mouse click) switch which pane is
-highlighted; the buttons act on it. Space delivers, Enter delivers and then
-sends a return, and a second button copies to the clipboard without pasting.
+with one highlighted. The styled pane appears only when a provider is configured.
+Both panes are editable: click into one to correct the text before styling or
+delivering.
+
+The keys depend on focus. With the window itself focused (as it opens after voice
+or clipboard input), Space delivers, Enter delivers and then sends a return, and
+Up/Down switch the highlighted pane. Once you click into a pane to edit, Space and
+Enter type normally; deliver with Ctrl+Enter or the button. Escape (or the second
+button) copies to the clipboard and closes without pasting. In keyboard mode the
+window opens with the cursor already in the pane, ready to type.
 
 ## Text normalisation
 

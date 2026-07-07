@@ -211,6 +211,16 @@ proc whisper_stderr {} {
     if {[string length $txt] > 2000} { set txt "…[string range $txt end-1999 end]" }
     return $txt
 }
+# A short, plain-language dialog line for a whisper failure. The out-of-memory
+# case is common and fixable, so name the fix; anything else points at the log,
+# where ui_error has written the full backend output. "out of memory" is the
+# wording CUDA, Vulkan, and Metal all use.
+proc transcribe_error_msg {tail} {
+    if {[string match -nocase "*out of memory*" $tail]} {
+        return "Couldn't transcribe: the GPU ran out of memory.\n\nFree some VRAM (another model may be loaded), or start scribe with --no-gpu to transcribe on the CPU."
+    }
+    return "Couldn't transcribe the recording. The details were written to the log."
+}
 
 #==============================================================================
 # CONFIG LOADING
@@ -649,7 +659,7 @@ proc inject_text {text} {
         enter_state typing
         set script "tell application \"System Events\" to keystroke [applescript_quote $text]"
         if {[catch {set ::inject_pid [exec osascript -e $script &]} err]} {
-            logsys err "osascript keystroke failed: $err"; finish 1; return
+            ui_error "osascript keystroke failed: $err"; return
         }
         poll_inject
         return
@@ -658,7 +668,7 @@ proc inject_text {text} {
     if {$actions eq ""} { finish 0; return }
     enter_state typing
     if {[catch {set ::inject_pid [exec dotool << $actions &]} err]} {
-        logsys err "dotool failed: $err"; finish 1; return
+        ui_error "dotool failed: $err"; return
     }
     poll_inject
 }
@@ -696,7 +706,7 @@ proc do_paste_exec {withEnter} {
     } else {
         set cmd [list dotool << $::PASTE_KEY]
     }
-    if {[catch {exec {*}$cmd} err]} { logsys err "paste keystroke failed: $err"; finish 1; return }
+    if {[catch {exec {*}$cmd} err]} { ui_error "paste keystroke failed: $err"; return }
     if {$withEnter} { after $::PASTE_ENTER_GAP_MS do_paste_enter } else { finish 0 }
 }
 proc do_paste_enter {} {
@@ -714,6 +724,23 @@ proc finish {code} {
     catch {tk systray destroy}
     if {$::tmpfile ne "" && $::TEST_FILE eq "" && !$::debug_mode} { catch {file delete $::tmpfile} }
     after 0 [list exit $code]
+}
+# A hard failure after the app has launched (recorder, whisper, delivery). In a
+# window session, surface it as a dialog so it is not lost to stderr/journal;
+# always log it and exit non-zero. There is no cheap, portable pre-flight for
+# GPU/VRAM sufficiency — nvidia-smi is NVIDIA-only and Vulkan/Metal/ROCm/CPU each
+# differ — so scribe reports the backend's own failure rather than guessing.
+proc ui_error {msg {detail ""}} {
+    logsys err "$msg[expr {$detail ne "" ? " ($detail)" : ""}]"
+    catch {tk systray destroy}
+    if {$::WINDOW} {
+        # Keep the dialog readable: show the short human message, never the raw
+        # backend dump (a whisper stderr tail runs taller than the screen). The
+        # full detail is in the log above.
+        set shown [expr {[string length $msg] > 400 ? "[string range $msg 0 399]…" : $msg}]
+        catch {wm withdraw .; tk_messageBox -type ok -icon error -title "Scribe" -message $shown}
+    }
+    finish 1
 }
 
 #==============================================================================
@@ -988,8 +1015,8 @@ proc transcribe {} {
     # deliver blank. --model is often given relative; report the cwd it resolved
     # against so a wrong relative path is obvious.
     if {![file exists $::MODEL]} {
-        logsys err "whisper model not found: $::MODEL (resolved from cwd [pwd]); pass an absolute --model"
-        finish 1; return
+        ui_error "whisper model not found: $::MODEL (resolved from cwd [pwd]); pass an absolute --model"
+        return
     }
     set wcmd [list whisper-cli -m $::MODEL -f $::tmpfile -nt -l $::LANG -t $::THREADS]
     if {$::PROMPT ne ""}   { lappend wcmd --prompt $::PROMPT }
@@ -1004,7 +1031,7 @@ proc transcribe {} {
     # mixing diagnostics into the transcript.
     set ::werrfile [file join $::CACHE_DIR "scribe-[pid].stderr"]
     if {[catch {set ::wchan [open "|$wcmd 2>$::werrfile" r]} err]} {
-        logsys err "whisper-cli failed to start: $err"; finish 1; return
+        ui_error "whisper-cli failed to start: $err"; return
     }
     set ::wbuf ""
     fconfigure $::wchan -blocking 0
@@ -1020,9 +1047,9 @@ proc transcribe_collect {} {
     fconfigure $::wchan -blocking 1
     if {[catch {close $::wchan} cerr]} {
         set tail [whisper_stderr]
-        logsys err "whisper-cli failed: $cerr[expr {$tail ne "" ? ": $tail" : ""}]"
         if {!$::debug_mode} { catch {file delete $::werrfile} }
-        finish 1; return
+        ui_error [transcribe_error_msg $tail] "whisper-cli failed: $cerr[expr {$tail ne "" ? ": $tail" : ""}]"
+        return
     }
     if {!$::debug_mode} { catch {file delete $::werrfile} }
     stop_animate
@@ -1077,12 +1104,12 @@ proc start_recording {} {
             lappend pcmd $::tmpfile
         }
         default {
-            logsys err "no recorder found: install sox (or pw-record on Linux)"
-            finish 1; return
+            ui_error "no recorder found: install sox (or pw-record on Linux)"
+            return
         }
     }
     if {[catch {set ::recorder_pid [exec {*}$pcmd &]} err]} {
-        logsys err "failed to start [lindex $pcmd 0]: $err"; finish 1; return
+        ui_error "failed to start [lindex $pcmd 0]: $err"; return
     }
     set ::poll_id [after 200 poll_recorder]
     set ::auto_stop_id [after [expr {$::TIMEOUT_S * 1000}] stop_recording]

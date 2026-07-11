@@ -124,6 +124,7 @@ set ::clipBackend   ""          ;# resolved once: wayland (wl-copy) | x11 (xclip
 set ::sourceText     ""
 set ::rewriteText    ""
 set ::preprocessText ""         ;# 2-pass: output of the preprocess call
+set ::pipelineModel  ""         ;# model the current pipeline runs (1-pass may pick thinking_model)
 set ::activeArea     1
 set ::rewriteState   idle
 
@@ -616,21 +617,22 @@ proc run_rewrite {} {
 
     set src [expr {[winfo exists .pane1.txt] ? [string trim [.pane1.txt get 1.0 end]] : $::sourceText}]
     set ::preprocessText ""
+    set ::pipelineModel $::apiModel
     switch -- $::PIPELINE_MODE {
         2pass {
             paneRewriteStatus "Preprocessing…"
-            api_call $::apiModel $::preprocessPrefix $src handle_preprocess
+            api_call $::pipelineModel $::preprocessPrefix $src handle_preprocess
         }
         1pass {
             paneRewriteStatus "Styling (thinking)…"
-            set model [expr {$::apiThinkingModel ne "" ? $::apiThinkingModel : $::apiModel}]
+            if {$::apiThinkingModel ne ""} { set ::pipelineModel $::apiThinkingModel }
             # Thinking models can spend the completion budget on reasoning
             # before the answer, so the merged call gets a larger cap.
-            api_call $model "${::mergedPassPrefix}\n${::styleGuide}" $src handle_rewrite 4000
+            api_call $::pipelineModel "${::mergedPassPrefix}\n${::styleGuide}" $src handle_rewrite 4000
         }
         default {
             paneRewriteStatus "Styling…"
-            api_call $::apiModel "${::singlePassPrefix}\n${::styleGuide}" $src handle_rewrite
+            api_call $::pipelineModel "${::singlePassPrefix}\n${::styleGuide}" $src handle_rewrite
         }
     }
 }
@@ -671,7 +673,8 @@ proc handle_rewrite {token} {
 proc unload_model {} {
     if {!$::UNLOAD_AFTER || !$::AI_AVAILABLE} return
     regsub {/v1/?$} $::apiBase {} base
-    set body [encoding convertto utf-8 "{\"model\":\"$::apiModel\",\"keep_alive\":0}"]
+    set m [expr {$::pipelineModel ne "" ? $::pipelineModel : $::apiModel}]
+    set body [encoding convertto utf-8 "{\"model\":\"$m\",\"keep_alive\":0}"]
     catch {
         set tok [http::geturl "${base}/api/generate" -method POST \
             -type "application/json" -query $body -timeout 4000]
@@ -1414,7 +1417,8 @@ proc run_self_test {} {
         # Dictation-shaped source: a self-correction, a repetition, and a
         # prerequisite recalled late, so the preprocess call has work to do.
         set ::sourceText "so the meeting moves to thursday, no wait, friday, the meeting moves to friday because the client called, oh and before that someone has to book the room"
-        foreach {_mode _label} {style "style-only" 2pass "2-pass" 1pass "1-pass"} {
+        foreach _mode {style 2pass 1pass} {
+            set _label [pipeline_label $_mode]
             set ::PIPELINE_MODE $_mode
             set ::rewriteState idle; set ::testDone 0
             run_rewrite

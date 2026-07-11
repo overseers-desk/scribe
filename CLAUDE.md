@@ -41,11 +41,12 @@ styled pane's header and persisted in an XDG state file beside the style pick
 - `style` — the style call alone.
 
 System prompts live in `system-prompts.yaml`: `preprocess_prefix` (2-pass call
-1), `merged_pass_prefix` (1-pass), `single_pass_prefix` (the style call). All
-calls share the `user_text_prefix` wrapper and the `api_call` /
-`api_response_text` plumbing. Only the terminal callback signals the self-test
-and windowless delivery: a stage that signals mid-chain releases the test's
-`vwait` and fires delivery at half pipeline.
+1), `merged_pass_prefix` (1-pass), `single_pass_prefix` (the style call, used
+alone in `style` mode and again as 2-pass's second call). All calls share the
+`user_text_prefix` wrapper and the `api_call` / `api_response_text` plumbing.
+Only the terminal callback signals the self-test and windowless delivery: a
+stage that signals mid-chain releases the test's `vwait` and fires delivery
+after only half the pipeline has run.
 
 ## AI provider config
 

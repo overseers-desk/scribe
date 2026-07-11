@@ -384,10 +384,10 @@ proc on_style_change {} {
 }
 
 # Pipeline modes: how a Style click reaches the styled text.
-#   2pass — preprocess call (repetitions merged, self-corrections resolved,
-#           points reordered), then the style call on the repaired text
-#   1pass — one merged call doing both, on thinking_model when configured
-#   style — the style call alone
+#   2pass: preprocess call (repetitions merged, self-corrections resolved,
+#          points reordered), then the style call on the repaired text
+#   1pass: one merged call doing both, on thinking_model when configured
+#   style: the style call alone
 # Internal tokens on the left, picker labels on the right.
 set ::PIPELINE_LABELS [dict create 2pass "2-pass" 1pass "1-pass" style "Style only"]
 

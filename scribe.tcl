@@ -101,7 +101,7 @@ set ::singlePassPrefix ""
 set ::preprocessPrefix ""
 set ::mergedPassPrefix ""
 set ::styleGuide       ""
-set ::PIPELINE_MODE    ""    ;# 2pass | 1pass | style (resolved by loadPipelineMode)
+set ::PIPELINE_MODE    2pass ;# 2pass | 1pass | style; loadPipelineMode applies the persisted pick
 
 # --- runtime ---
 set ::recorder_pid  0
@@ -120,10 +120,11 @@ set ::ukmap         ""
 set ::clipBackend   ""          ;# resolved once: wayland (wl-copy) | x11 (xclip)
 
 # --- review ---
-set ::sourceText    ""
-set ::rewriteText   ""
-set ::activeArea    1
-set ::rewriteState  idle
+set ::sourceText     ""
+set ::rewriteText    ""
+set ::preprocessText ""         ;# 2-pass: output of the preprocess call
+set ::activeArea     1
+set ::rewriteState   idle
 
 #==============================================================================
 # ARGUMENT PARSING
@@ -541,74 +542,129 @@ proc jsonEscape {str} {
     return $result
 }
 
-proc buildJSONPayload {model systemPrompt userText} {
+proc buildJSONPayload {model systemPrompt userText {maxTokens 2000}} {
     set json "\{\"model\":\"[jsonEscape $model]\","
     append json "\"messages\":\["
     append json "\{\"role\":\"system\",\"content\":\"[jsonEscape $systemPrompt]\"\},"
     append json "\{\"role\":\"user\",\"content\":\"[jsonEscape $userText]\"\}"
-    append json "\],\"temperature\":0.7,\"max_tokens\":2000\}"
+    append json "\],\"temperature\":0.7,\"max_tokens\":$maxTokens\}"
     return $json
 }
 
-proc run_rewrite {} {
-    set ::autosend_id ""
-    if {$::rewriteState ni {idle error}} return
-    set ::rewriteState running
-    paneRewriteStatus "Styling…"
-    if {!$::WINDOW} { enter_state styling }
-
+# POST one chat completion; the callback receives the http token. Any launch
+# failure ends the pipeline through api_fail.
+proc api_call {model systemPrompt userText callback {maxTokens 2000}} {
     package require http
     package require tls
     if {[catch { ::tls::init -autoservername true; http::register https 443 [list ::tls::socket -autoservername true] }]} {
         http::register https 443 ::tls::socket
     }
-
-    # Style what is currently in the source pane (the user may have edited the
-    # transcription/clipboard text); fall back to the variable when windowless.
-    set src [expr {[winfo exists .pane1.txt] ? [string trim [.pane1.txt get 1.0 end]] : $::sourceText}]
-    set systemPrompt "${::singlePassPrefix}\n${::styleGuide}"
-    set wrappedText  "${::userTextPrefix}${src}\n"
-    set payload [encoding convertto utf-8 [buildJSONPayload $::apiModel $systemPrompt $wrappedText]]
+    set payload [encoding convertto utf-8 [buildJSONPayload $model $systemPrompt "${::userTextPrefix}${userText}\n" $maxTokens]]
     set headers [list Authorization "Bearer $::apiKey" Content-Type "application/json; charset=utf-8"]
     if {[catch {
         set ::httpToken [http::geturl "${::apiBase}/chat/completions" \
             -method POST -headers $headers -type "application/json" \
-            -query $payload -timeout 60000 -command handle_rewrite]
+            -query $payload -timeout 60000 -command $callback]
     } err]} {
-        set ::rewriteState error; paneRewriteStatus "Error: $err"; signalTestDone; styleDone
+        api_fail "Error: $err"
     }
 }
 
-proc handle_rewrite {token} {
+# Terminal failure of any pipeline stage: report in the styled pane and end
+# the run (self-test release, windowless delivery fallback).
+proc api_fail {msg} {
+    set ::rewriteState error
+    paneRewriteStatus $msg
+    signalTestDone
+    styleDone
+}
+
+# Shared tail of the pipeline callbacks: unwrap the HTTP token to normalised
+# assistant text. On failure routes through api_fail and returns ""; callers
+# must check ::rewriteState before using the result.
+proc api_response_text {token} {
     set ::httpToken ""
     set status [http::status $token]
     set ncode  [http::ncode $token]
     set data   [encoding convertfrom utf-8 [http::data $token]]
     after idle [list http::cleanup $token]
-    if {$status ne "ok"} { set ::rewriteState error; paneRewriteStatus "Network error: $status"; signalTestDone; styleDone; return }
-    if {$ncode != 200}   { set ::rewriteState error; paneRewriteStatus "API error $ncode"; signalTestDone; styleDone; return }
+    if {$status ne "ok"} { api_fail "Network error: $status"; return "" }
+    if {$ncode != 200}   { api_fail "API error $ncode"; return "" }
     if {[catch {
         package require json
         set resp [json::json2dict $data]
         set content [dict get [lindex [dict get $resp choices] 0] message content]
-        set content [string map {— " - "} $content]
-        set ::rewriteText [normalize_text [string trim $content]]
-        set ::rewriteState done
-        paneSetRewrite $::rewriteText
-        setActiveArea 2
-    } err]} {
-        set ::rewriteState error; paneRewriteStatus "Parse error: $err"
+    } err]} { api_fail "Parse error: $err"; return "" }
+    # llama.cpp's OpenAI endpoint returns thinking-model reasoning inline as a
+    # leading <think> block (Ollama keeps it in a separate field); drop it.
+    regsub {^\s*<think>.*?</think>\s*} $content {} content
+    set content [string map {— " - "} $content]
+    return [normalize_text [string trim $content]]
+}
+
+# Run the styling pipeline in the picked mode (see ::PIPELINE_LABELS) on what
+# is currently in the source pane (the user may have edited the transcription/
+# clipboard text); fall back to the variable when windowless.
+proc run_rewrite {} {
+    set ::autosend_id ""
+    if {$::rewriteState ni {idle error}} return
+    set ::rewriteState running
+    if {!$::WINDOW} { enter_state styling }
+
+    set src [expr {[winfo exists .pane1.txt] ? [string trim [.pane1.txt get 1.0 end]] : $::sourceText}]
+    set ::preprocessText ""
+    switch -- $::PIPELINE_MODE {
+        2pass {
+            paneRewriteStatus "Preprocessing…"
+            api_call $::apiModel $::preprocessPrefix $src handle_preprocess
+        }
+        1pass {
+            paneRewriteStatus "Styling (thinking)…"
+            set model [expr {$::apiThinkingModel ne "" ? $::apiThinkingModel : $::apiModel}]
+            # Thinking models can spend the completion budget on reasoning
+            # before the answer, so the merged call gets a larger cap.
+            api_call $model "${::mergedPassPrefix}\n${::styleGuide}" $src handle_rewrite 4000
+        }
+        default {
+            paneRewriteStatus "Styling…"
+            api_call $::apiModel "${::singlePassPrefix}\n${::styleGuide}" $src handle_rewrite
+        }
     }
+}
+
+# 2-pass call 1 returned: show the repaired text in the styled pane (it stays
+# visible while the style call runs, and the styled text replaces it), then
+# chain the style call on it. The source pane keeps the raw text. No
+# signalTestDone/styleDone here on success: only the terminal handler signals,
+# or the self-test's vwait would release (and windowless delivery fire) after
+# half the pipeline.
+proc handle_preprocess {token} {
+    set text [api_response_text $token]
+    if {$::rewriteState eq "error"} return
+    set ::preprocessText $text
+    paneSetRewrite $text
+    api_call $::apiModel "${::singlePassPrefix}\n${::styleGuide}" $text handle_rewrite
+}
+
+proc handle_rewrite {token} {
+    set text [api_response_text $token]
+    if {$::rewriteState eq "error"} return
+    set ::rewriteText $text
+    set ::rewriteState done
+    paneSetRewrite $::rewriteText
+    setActiveArea 2
     signalTestDone
     styleDone
 }
 
 proc signalTestDone {} { if {$::SELF_TEST} { set ::testDone 1 } }
 
-# Unattended: once the (blocking) style pass returns, deliver.
+# Unattended: once the pipeline returns, deliver. A style failure after a
+# successful preprocess still delivers the repaired text.
 proc styleDone {} {
     if {$::WINDOW || $::SELF_TEST} return
-    deliver_now [expr {$::rewriteState eq "done" ? $::rewriteText : $::sourceText}]
+    if {$::rewriteState eq "done"} { deliver_now $::rewriteText; return }
+    deliver_now [expr {$::preprocessText ne "" ? $::preprocessText : $::sourceText}]
 }
 
 #==============================================================================
@@ -857,6 +913,12 @@ proc build_review_ui {} {
             -values [styleNames] -textvariable ::STYLE_NAME -takefocus 0
         bind .pane2.hdr.style <<ComboboxSelected>> {on_style_change; focus .}
         pack .pane2.hdr.style -side left -padx 6
+        # Pipeline picker: how the Style click runs (see ::PIPELINE_LABELS).
+        ttk::combobox .pane2.hdr.pipe -state readonly -width 10 \
+            -values [dict values $::PIPELINE_LABELS] -takefocus 0
+        .pane2.hdr.pipe set [pipeline_label $::PIPELINE_MODE]
+        bind .pane2.hdr.pipe <<ComboboxSelected>> {on_pipeline_change; focus .}
+        pack .pane2.hdr.pipe -side left
         text .pane2.txt -height 8 -width 80 -wrap word -relief solid -borderwidth 2 -takefocus 0
         pack .pane2.txt -fill both -expand 1
         bind .pane2.txt <Button-1> {setActiveArea 2}
@@ -1418,7 +1480,7 @@ if {$::STYLE_ON && !$::AI_AVAILABLE} {
 # In a window the Style button is always offered when a provider is configured,
 # so load the guide and prompts whenever the feature is reachable; --no-window
 # needs them only when --style forces the pass.
-if {$::AI_AVAILABLE && ($::WINDOW || $::STYLE_ON)} { loadStyle; loadSystemPrompts }
+if {$::AI_AVAILABLE && ($::WINDOW || $::STYLE_ON)} { loadStyle; loadSystemPrompts; loadPipelineMode }
 
 if {$::SELF_TEST} { after idle run_self_test; vwait forever }
 if {$::TEST_TEXT ne ""} { after idle [list on_source_ready $::TEST_TEXT]; vwait forever }

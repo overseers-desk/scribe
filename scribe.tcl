@@ -48,6 +48,7 @@ set ::CACHE_DIR        [file join [expr {[info exists ::env(XDG_CACHE_HOME)] && 
 
 set ::VERSION          0.6.2
 set ::PORT             4212
+set ::SOCKET_TIMEOUT_MS 2000   ;# second-press protocol deadline, both sides
 set ::APPNAME          "scribe-[pid]"
 set ::MACOS            [expr {$::tcl_platform(os) eq "Darwin"}]
 
@@ -1388,17 +1389,37 @@ proc start_recording {} {
 # SECOND-PRESS SOCKET (voice): stop / status / pause / resume
 #==============================================================================
 
+# The exchange runs non-blocking against a deadline: a healthy peer answers in
+# milliseconds, and a wedged one must not hang the press invisibly (a hung probe
+# is a keystroke that silently did nothing). On timeout, exit nonzero without
+# recording — the peer still holds the port, so a second recorder could not
+# bind; the log line is what tells the user which pid to kill.
 proc probe_running {cmd} {
     if {[catch {socket 127.0.0.1 $::PORT} sock]} { return }
-    fconfigure $sock -buffering line -translation lf
-    gets $sock _banner; puts $sock $cmd
-    set reply ""
-    while {[gets $sock line] >= 0} {
-        if {[string match "OK*" $line] || [string match "ACK*" $line]} { set reply $line; break }
+    fconfigure $sock -buffering line -translation lf -blocking 0
+    set ::probe_reply ""
+    set ::probe_done ""
+    set ::probe_banner_seen 0
+    fileevent $sock readable [list probe_read $sock $cmd]
+    set deadline [after $::SOCKET_TIMEOUT_MS {set ::probe_done timeout}]
+    vwait ::probe_done
+    after cancel $deadline
+    catch {close $sock}
+    if {$::probe_done eq "timeout"} {
+        logsys warning "running scribe on port $::PORT did not answer '$cmd' within [expr {$::SOCKET_TIMEOUT_MS / 1000}]s — instance wedged? find it with: pgrep -af scribe.tcl"
+        exit 1
     }
-    close $sock
-    if {[string match "OK*" $reply]} { exit 0 }
+    if {[string match "OK*" $::probe_reply]} { exit 0 }
     exit 1
+}
+proc probe_read {sock cmd} {
+    while {[gets $sock line] >= 0} {
+        if {!$::probe_banner_seen} { set ::probe_banner_seen 1; puts $sock $cmd; continue }
+        if {[string match "OK*" $line] || [string match "ACK*" $line]} {
+            set ::probe_reply $line; set ::probe_done reply; return
+        }
+    }
+    if {[eof $sock]} { set ::probe_done eof }
 }
 proc serve_listener {} {
     if {[catch {socket -server handle_client -myaddr 127.0.0.1 $::PORT} sock]} {
@@ -1407,11 +1428,31 @@ proc serve_listener {} {
     set ::listener $sock
 }
 proc stop_listener {} { if {[info exists ::listener]} { catch {close $::listener}; unset ::listener } }
+# The command is read via fileevent with a per-connection deadline, never a
+# blocking gets: one client that connects and goes silent would otherwise stall
+# the whole event loop — icon animation, the --timeout auto-stop, and recorder
+# polling all dead while the mic keeps recording.
 proc handle_client {sock _addr _port} {
-    fconfigure $sock -buffering line -translation lf
+    fconfigure $sock -buffering line -translation lf -blocking 0
     puts $sock "OK scribe 1"
-    if {[gets $sock cmd] < 0} { close $sock; return }
-    switch -- [string trim $cmd] {
+    set timer [after $::SOCKET_TIMEOUT_MS [list client_expire $sock]]
+    fileevent $sock readable [list client_read $sock $timer]
+}
+proc client_expire {sock} {
+    logsys warning "second-press client sent no command within [expr {$::SOCKET_TIMEOUT_MS / 1000}]s — dropping it"
+    catch {close $sock}
+}
+proc client_read {sock timer} {
+    if {[gets $sock cmd] < 0} {
+        if {[eof $sock]} { after cancel $timer; catch {close $sock} }
+        return
+    }
+    after cancel $timer
+    client_dispatch $sock [string trim $cmd]
+    catch {close $sock}
+}
+proc client_dispatch {sock cmd} {
+    switch -- $cmd {
         stop  { puts $sock "OK"; after idle stop_recording }
         pause {
             if {$::state eq "paused"} { puts $sock "ACK already-paused" } \
@@ -1428,7 +1469,6 @@ proc handle_client {sock _addr _port} {
         status { puts $sock "state $::state"; puts $sock "OK" }
         default { puts $sock "ACK unknown-command" }
     }
-    close $sock
 }
 proc stop_recording {} {
     stop_listener
@@ -1558,6 +1598,25 @@ proc run_self_test {} {
     } else {
         puts "SKIP: style pass (no AI provider configured)"
     }
+
+    # Second-press protocol: a client that connects and sends nothing must leave
+    # the event loop running (timers still fire) and be dropped at the deadline.
+    set _saveT $::SOCKET_TIMEOUT_MS
+    set ::SOCKET_TIMEOUT_MS 200
+    serve_listener
+    if {[info exists ::listener]} {
+        set _silent [socket 127.0.0.1 $::PORT]
+        set ::_beat 0; after 80 {set ::_beat 1}; vwait ::_beat
+        check "silent client leaves event loop alive" {$::_beat == 1}
+        set ::_drop 0; after 400 {set ::_drop 1}; vwait ::_drop
+        fconfigure $_silent -blocking 0
+        gets $_silent _banner
+        gets $_silent _dummy
+        check "silent client dropped at deadline" {[eof $_silent]}
+        catch {close $_silent}
+        stop_listener
+    } else { puts "SKIP: second-press socket (port $::PORT busy)" }
+    set ::SOCKET_TIMEOUT_MS $_saveT
 
     set ::DELIVER clipboard
     if {![catch {set_clipboard "round-trip-probe"}]} {

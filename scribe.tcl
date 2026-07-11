@@ -725,6 +725,36 @@ proc finish {code} {
     if {$::tmpfile ne "" && $::TEST_FILE eq "" && !$::debug_mode} { catch {file delete $::tmpfile} }
     after 0 [list exit $code]
 }
+# A copyable modal message dialog. tk_messageBox draws its text as a static label
+# that X11 will not let you select, so a message a user may want to paste elsewhere
+# (a GPU error to search, a config path to open) goes through here: the body sits
+# in a read-only text widget that selects and copies, with a Copy button for the
+# whole message. Blocks until dismissed, like tk_messageBox.
+proc show_dialog {title body} {
+    set w .dlg
+    catch {destroy $w}
+    toplevel $w
+    wm title $w $title
+    wm transient $w .
+    set nlines [llength [split $body \n]]
+    set h [expr {$nlines < 3 ? 3 : ($nlines > 18 ? 18 : $nlines)}]
+    text $w.msg -wrap word -width 56 -height $h -relief flat -takefocus 0 \
+        -padx 8 -pady 8 -highlightthickness 0
+    $w.msg insert 1.0 $body
+    $w.msg configure -state disabled
+    pack $w.msg -fill both -expand 1 -padx 8 -pady {10 4}
+    pack [ttk::frame $w.btns] -fill x -padx 8 -pady {0 8}
+    ttk::button $w.btns.ok   -text "OK"   -command [list destroy $w]
+    ttk::button $w.btns.copy -text "Copy" -takefocus 0 -command [list set_clipboard $body]
+    pack $w.btns.ok -side right
+    pack $w.btns.copy -side right -padx 4
+    bind $w <Return> [list destroy $w]
+    bind $w <Escape> [list destroy $w]
+    focus $w.btns.ok
+    catch {grab set $w}
+    tkwait window $w
+}
+
 # A hard failure after the app has launched (recorder, whisper, delivery). In a
 # window session, surface it as a dialog so it is not lost to stderr/journal;
 # always log it and exit non-zero. There is no cheap, portable pre-flight for
@@ -738,7 +768,7 @@ proc ui_error {msg {detail ""}} {
         # backend dump (a whisper stderr tail runs taller than the screen). The
         # full detail is in the log above.
         set shown [expr {[string length $msg] > 400 ? "[string range $msg 0 399]…" : $msg}]
-        catch {wm withdraw .; tk_messageBox -type ok -icon error -title "Scribe" -message $shown}
+        catch {wm withdraw .; show_dialog "Scribe" $shown}
     }
     finish 1
 }
@@ -756,10 +786,8 @@ set ::PANE_BG  "#ffffff"
 proc style_or_prompt {} {
     if {$::AI_AVAILABLE} { run_rewrite; return }
     set cfg [lindex [config_candidates] 0]
-    tk_messageBox -parent . -type ok -icon info \
-        -title "Styling needs an AI provider" \
-        -message "No AI provider is configured yet." \
-        -detail "Add one to:\n$cfg\n\nSee config.example.ini for the format — any OpenAI-compatible endpoint, including a local Ollama model. Reopen Scribe once it is set."
+    show_dialog "Styling needs an AI provider" \
+        "No AI provider is configured yet.\n\nAdd one to:\n$cfg\n\nSee config.example.ini for the format (any OpenAI-compatible endpoint, including a local Ollama model). Reopen Scribe once it is set."
 }
 
 proc build_review_ui {} {

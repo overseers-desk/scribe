@@ -52,3 +52,10 @@ The INI reader (`parse_ini`) is a deliberately minimal subset — `[section]`
 headers and `key = value` lines with optional `"`/`'` quoting and trailing `#`
 comments. No value continuation or `;` comments; scribe's config needs none.
 Keep it that way unless the config genuinely grows to need more.
+
+A provider may set `unload_after_style = true` (Ollama only): after a successful
+style pass scribe drops the model from VRAM through Ollama's native `/api/generate`
+(`keep_alive 0`), so whisper has the GPU on the next recording. The style request
+itself goes through the OpenAI-compatible endpoint, which ignores `keep_alive`,
+hence the separate native call. It is for a single GPU that cannot hold both the
+chat model and the whisper model, and costs a cold reload on the next style pass.

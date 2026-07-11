@@ -94,6 +94,7 @@ set ::AI_AVAILABLE 0         ;# 1 once a provider with an api_key resolves
 set ::apiKey  ""
 set ::apiBase ""
 set ::apiModel ""
+set ::UNLOAD_AFTER 0         ;# provider opt-in: drop the model from VRAM after a successful style pass
 set ::userTextPrefix   ""
 set ::singlePassPrefix ""
 set ::styleGuide       ""
@@ -266,6 +267,7 @@ proc config_candidates {} {
 # otherwise leaves ::AI_AVAILABLE 0 and the style pass stays disabled.
 proc loadConfig {} {
     set ::AI_AVAILABLE 0
+    set ::UNLOAD_AFTER 0
     set path ""
     foreach c [config_candidates] { if {[file exists $c]} { set path $c; break } }
     if {$path eq ""} { loadLegacyDeepseek; return }
@@ -289,6 +291,7 @@ proc loadConfig {} {
     set ::apiKey   [expr {[dict exists $p api_key]  ? [dict get $p api_key]  : ""}]
     set ::apiBase  [expr {[dict exists $p api_base] ? [dict get $p api_base] : "https://api.deepseek.com"}]
     set ::apiModel [expr {[dict exists $p model]    ? [dict get $p model]    : "deepseek-chat"}]
+    set ::UNLOAD_AFTER [expr {[dict exists $p unload_after_style] && [string is true -strict [dict get $p unload_after_style]]}]
     if {$::apiKey ne ""} {
         set ::AI_AVAILABLE 1; dbg "provider = $choice ($path)"
     } else {
@@ -553,8 +556,26 @@ proc handle_rewrite {token} {
     } err]} {
         set ::rewriteState error; paneRewriteStatus "Parse error: $err"
     }
+    unload_model
     signalTestDone
     styleDone
+}
+
+# Opt-in (provider's unload_after_style): after a style pass, ask a local Ollama to
+# drop the model from VRAM so whisper has the GPU on the next recording. The style
+# request goes through the OpenAI-compatible endpoint, which ignores keep_alive, so
+# the unload is a separate call to Ollama's native /api/generate (keep_alive 0 and
+# no prompt, so it returns in milliseconds without generating). Best-effort: a failure
+# here never disturbs the delivered text. Costs a cold model reload on the next pass.
+proc unload_model {} {
+    if {!$::UNLOAD_AFTER || !$::AI_AVAILABLE} return
+    regsub {/v1/?$} $::apiBase {} base
+    set body [encoding convertto utf-8 "{\"model\":\"$::apiModel\",\"keep_alive\":0}"]
+    catch {
+        set tok [http::geturl "${base}/api/generate" -method POST \
+            -type "application/json" -query $body -timeout 4000]
+        http::cleanup $tok
+    }
 }
 
 proc signalTestDone {} { if {$::SELF_TEST} { set ::testDone 1 } }
@@ -1266,10 +1287,11 @@ proc run_self_test {} {
         check "recorder prefers pw-record" {[resolve_recorder] eq "pw-record"}
     }
 
-    set _ini [parse_ini "default_provider = \"x\"\n# a comment\n\[provider.x\]\napi_key = \"k\"\nmodel = 'm'  # inline\n"]
+    set _ini [parse_ini "default_provider = \"x\"\n# a comment\n\[provider.x\]\napi_key = \"k\"\nmodel = 'm'  # inline\nunload_after_style = true\n"]
     check "ini default_provider" {[dict get $_ini "" default_provider] eq "x"}
     check "ini provider section"  {[dict get $_ini "provider.x" api_key] eq "k"}
     check "ini single-quote val"  {[dict get $_ini "provider.x" model] eq "m"}
+    check "ini boolean opt-in"    {[string is true -strict [dict get $_ini "provider.x" unload_after_style]]}
 
     set ::sourceText "src"; set ::rewriteText "rw"; setActiveArea 1
     check "active=source pane1" {[active_text] eq "src"}

@@ -41,6 +41,7 @@ set ::STYLES_DIR       [file join $::APP_DIR "styles"]
 set ::SYSTEM_PROMPTS   [file join $::APP_DIR "system-prompts.yaml"]
 set ::CONFIG_FILE      [file join $::APP_DIR "current-mode.conf"]
 set ::STATE_STYLE_FILE [file join [expr {[info exists ::env(XDG_STATE_HOME)] && $::env(XDG_STATE_HOME) ne "" ? $::env(XDG_STATE_HOME) : "$::env(HOME)/.local/state"}] scribe style]
+set ::STATE_PIPELINE_FILE [file join [file dirname $::STATE_STYLE_FILE] pipeline]
 set ::DIALECT_FILE     [file join $::APP_DIR "dialect-us-to-british.tsv"]
 set ::LOG_DIR          /var/local/log/dictation
 set ::CACHE_DIR        [file join [expr {[info exists ::env(XDG_CACHE_HOME)] && $::env(XDG_CACHE_HOME) ne "" ? $::env(XDG_CACHE_HOME) : "$::env(HOME)/.cache"}] scribe]
@@ -94,9 +95,13 @@ set ::AI_AVAILABLE 0         ;# 1 once a provider with an api_key resolves
 set ::apiKey  ""
 set ::apiBase ""
 set ::apiModel ""
+set ::apiThinkingModel ""    ;# optional; 1-pass mode falls back to ::apiModel
 set ::userTextPrefix   ""
 set ::singlePassPrefix ""
+set ::preprocessPrefix ""
+set ::mergedPassPrefix ""
 set ::styleGuide       ""
+set ::PIPELINE_MODE    ""    ;# 2pass | 1pass | style (resolved by loadPipelineMode)
 
 # --- runtime ---
 set ::recorder_pid  0
@@ -289,6 +294,7 @@ proc loadConfig {} {
     set ::apiKey   [expr {[dict exists $p api_key]  ? [dict get $p api_key]  : ""}]
     set ::apiBase  [expr {[dict exists $p api_base] ? [dict get $p api_base] : "https://api.deepseek.com"}]
     set ::apiModel [expr {[dict exists $p model]    ? [dict get $p model]    : "deepseek-chat"}]
+    set ::apiThinkingModel [expr {[dict exists $p thinking_model] ? [dict get $p thinking_model] : ""}]
     if {$::apiKey ne ""} {
         set ::AI_AVAILABLE 1; dbg "provider = $choice ($path)"
     } else {
@@ -319,6 +325,8 @@ proc loadSystemPrompts {} {
         set cfg [yaml::yaml2dict $data]
         set ::userTextPrefix   [expr {[dict exists $cfg user_text_prefix]   ? [dict get $cfg user_text_prefix]   : ""}]
         set ::singlePassPrefix [expr {[dict exists $cfg single_pass_prefix] ? [dict get $cfg single_pass_prefix] : ""}]
+        set ::preprocessPrefix [expr {[dict exists $cfg preprocess_prefix]  ? [dict get $cfg preprocess_prefix]  : ""}]
+        set ::mergedPassPrefix [expr {[dict exists $cfg merged_pass_prefix] ? [dict get $cfg merged_pass_prefix] : ""}]
     } err]} { fatal "error loading system-prompts.yaml: $err" }
 }
 
@@ -369,6 +377,44 @@ proc saveStyleChoice {name} {
 proc on_style_change {} {
     loadStyle
     saveStyleChoice $::STYLE_NAME
+}
+
+# Pipeline modes: how a Style click reaches the styled text.
+#   2pass — preprocess call (repetitions merged, self-corrections resolved,
+#           points reordered), then the style call on the repaired text
+#   1pass — one merged call doing both, on thinking_model when configured
+#   style — the style call alone
+# Internal tokens on the left, picker labels on the right.
+set ::PIPELINE_LABELS [dict create 2pass "2-pass" 1pass "1-pass" style "Style only"]
+
+proc pipeline_label {mode} { dict get $::PIPELINE_LABELS $mode }
+proc pipeline_mode_for {label} {
+    dict for {m l} $::PIPELINE_LABELS { if {$l eq $label} { return $m } }
+    return 2pass
+}
+
+# The window's persisted pipeline pick (sibling of the style pick), defaulting
+# to the two-pass chain.
+proc loadPipelineMode {} {
+    set mode ""
+    if {[file exists $::STATE_PIPELINE_FILE]} {
+        catch { set f [open $::STATE_PIPELINE_FILE r]; set mode [string trim [read $f]]; close $f }
+    }
+    if {$mode ni {2pass 1pass style}} { set mode 2pass }
+    set ::PIPELINE_MODE $mode
+    dbg "pipeline = $mode"
+}
+
+proc savePipelineChoice {mode} {
+    catch {
+        file mkdir [file dirname $::STATE_PIPELINE_FILE]
+        set f [open $::STATE_PIPELINE_FILE w]; puts -nonewline $f $mode; close $f
+    }
+}
+
+proc on_pipeline_change {} {
+    set ::PIPELINE_MODE [pipeline_mode_for [.pane2.hdr.pipe get]]
+    savePipelineChoice $::PIPELINE_MODE
 }
 
 #==============================================================================

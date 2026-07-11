@@ -14,39 +14,44 @@ API key of any kind**. This is a hard invariant — do not break it.
   - `loadConfig` leaves `::AI_AVAILABLE` at 0 and resolves nothing;
   - `--style` / `--auto-style-delay` degrade to dictation (with a `notice`), they
     do not error;
-  - the review window shows a **single** pane — the styled pane and the Up/Down
-    pane-switch bindings are not created. The Style button stays: clicking it
-    opens a dialog naming `config.ini` and pointing at the example, so styling
-    reads as unconfigured, not missing (`style_or_prompt`).
+  - the review window shows a **single** pane — the rewrite controls, the
+    result pane, and the Up/Down pane-switch bindings are not created. The
+    Rewrite button stays: clicking it opens a dialog naming `config.ini` and
+    pointing at the example, so rewriting reads as unconfigured, not missing
+    (`rewrite_or_prompt`).
 
 Concretely: `::AI_AVAILABLE` is the gate for *every provider call* — the
 preprocess call and the style call alike; any code that sends text to a
 provider must sit behind it. The self-test must pass both with a provider (all
-three pipeline modes run) and without one (no provider call is made; the
-single-pane UI with a config-prompting Style button is asserted).
+three rewrite dispatches run) and without one (no provider call is made; the
+single-pane UI with a config-prompting Rewrite button is asserted).
 
-## Styling pipeline
+## Rewrite pipeline
 
-A Style click (or windowless `--style`) runs one of three modes, picked in the
-styled pane's header and persisted in an XDG state file beside the style pick
-(default `2pass`):
+A Rewrite click (or windowless `--style`) runs a pipeline picked by two
+independent choices, offered as radio rows in the window and persisted in XDG
+state files (`style` and `pipeline`, side by side):
 
-- `2pass` — a preprocess call (repetitions merged, self-corrections resolved,
-  points reordered) on the provider's `model`, then the style call on the
-  repaired text. The styled pane shows the repaired text until the styled text
-  replaces it; the source pane keeps the raw text.
-- `1pass` — one merged call (preprocess instructions + style guide) to the
-  provider's `thinking_model`, falling back to `model`, with a higher token cap
-  since reasoning can eat the completion budget.
-- `style` — the style call alone.
+- **Style** — a `styles/NAME.txt` guide, or the reserved name `none` ("No
+  style", the default): the clean-up pass alone (repetitions merged,
+  self-corrections resolved, points reordered), no style call.
+- **Passes** — how a styled rewrite runs. `2` (default): the clean-up call on
+  the provider's `model`, then the style call on the repaired text; the result
+  pane shows the repaired text until the styled text replaces it, and the
+  source pane keeps the raw text. `1`: one merged call (clean-up instructions +
+  style guide) to the provider's `thinking_model`, falling back to `model`,
+  with a higher token cap since reasoning can eat the completion budget. Moot
+  under `none`, so the window greys the row rather than hiding it. Values
+  persisted by the former pipeline picker (`2pass`/`1pass`/`style`) load as
+  2/1/2 — the style-only call no longer exists; a Rewrite always cleans up.
 
-System prompts live in `system-prompts.yaml`: `preprocess_prefix` (2-pass call
-1), `merged_pass_prefix` (1-pass), `single_pass_prefix` (the style call, used
-alone in `style` mode and again as 2-pass's second call). All calls share the
-`user_text_prefix` wrapper and the `api_call` / `api_response_text` plumbing.
-Only the terminal callback signals the self-test and windowless delivery: a
-stage that signals mid-chain releases the test's `vwait` and fires delivery
-after only half the pipeline has run.
+System prompts live in `system-prompts.yaml`: `preprocess_prefix` (the
+clean-up call), `merged_pass_prefix` (1-pass), `single_pass_prefix` (the style
+call, 2-pass call 2). All calls share the `user_text_prefix` wrapper and the
+`api_call` / `api_response_text` plumbing. Only the terminal callback signals
+the self-test and windowless delivery: a stage that signals mid-chain releases
+the test's `vwait` and fires delivery after only half the pipeline has run.
+Under `none` the clean-up call is itself the terminal stage.
 
 ## AI provider config
 

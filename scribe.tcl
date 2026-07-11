@@ -108,7 +108,7 @@ set ::singlePassPrefix ""
 set ::preprocessPrefix ""
 set ::mergedPassPrefix ""
 set ::styleGuide       ""
-set ::PIPELINE_MODE    2pass ;# 2pass | 1pass | style; loadPipelineMode applies the persisted pick
+set ::PASSES           2     ;# 1 | 2 rewrite calls when a style is picked; loadPasses applies the persisted pick
 
 # --- runtime ---
 set ::recorder_pid  0
@@ -375,14 +375,22 @@ proc loadStyle {} {
     set name $::STYLE_NAME
     if {$name eq ""} {
         # The window's own persisted pick wins; a mode-switcher default in
-        # current-mode.conf applies when no state file exists; else "clear".
+        # current-mode.conf applies when no state file exists; else "none".
         foreach src [list $::STATE_STYLE_FILE $::CONFIG_FILE] {
             if {$name ne ""} break
             if {[file exists $src]} {
                 catch { set f [open $src r]; set name [string trim [read $f]]; close $f }
             }
         }
-        if {$name eq ""} { set name "clear" }
+        if {$name eq ""} { set name "none" }
+    }
+    # "none" is the reserved No-style pick, not a style file: a Rewrite runs
+    # the clean-up pass alone, so there is no guide to load.
+    if {$name eq "none"} {
+        set ::styleGuide ""
+        set ::STYLE_NAME "none"
+        dbg "style = none (clean-up only)"
+        return
     }
     set path [file join $::STYLES_DIR "$name.txt"]
     if {![file exists $path]} {
@@ -413,49 +421,46 @@ proc saveStyleChoice {name} {
     }
 }
 
-# The style combobox set ::STYLE_NAME via -textvariable; reload the guide for it
-# and persist the pick. The pass itself runs only on a Style click.
+# The style radios set ::STYLE_NAME; reload the guide for it, persist the pick,
+# and refresh the controls that depend on it. The pass itself runs only on a
+# Rewrite click.
 proc on_style_change {} {
     loadStyle
     saveStyleChoice $::STYLE_NAME
+    refresh_rewrite_controls
 }
 
-# Pipeline modes: how a Style click reaches the styled text.
-#   2pass: preprocess call (repetitions merged, self-corrections resolved,
-#          points reordered), then the style call on the repaired text
-#   1pass: one merged call doing both, on thinking_model when configured
-#   style: the style call alone
-# Internal tokens on the left, picker labels on the right.
-set ::PIPELINE_LABELS [dict create 2pass "2-pass" 1pass "1-pass" style "Style only"]
+# What a Rewrite click runs is picked by two independent, persisted choices:
+#   style  — a styles/NAME.txt guide, or "none": the clean-up pass alone
+#            (repetitions merged, self-corrections resolved, points reordered)
+#   passes — with a style picked, 2 = clean-up call, then the style call on the
+#            repaired text; 1 = one merged call doing both, on thinking_model
+#            when configured. Moot under "none": always the one clean-up call.
 
-proc pipeline_label {mode} { dict get $::PIPELINE_LABELS $mode }
-proc pipeline_mode_for {label} {
-    dict for {m l} $::PIPELINE_LABELS { if {$l eq $label} { return $m } }
-    return 2pass
-}
-
-# The window's persisted pipeline pick (sibling of the style pick), defaulting
-# to the two-pass chain.
-proc loadPipelineMode {} {
-    set mode ""
+# The window's persisted passes pick (sibling of the style pick), default 2.
+proc loadPasses {} {
+    set v ""
     if {[file exists $::STATE_PIPELINE_FILE]} {
-        catch { set f [open $::STATE_PIPELINE_FILE r]; set mode [string trim [read $f]]; close $f }
+        catch { set f [open $::STATE_PIPELINE_FILE r]; set v [string trim [read $f]]; close $f }
     }
-    if {$mode ni {2pass 1pass style}} { set mode 2pass }
-    set ::PIPELINE_MODE $mode
-    dbg "pipeline = $mode"
+    # Values persisted by the former pipeline picker map onto the passes axis;
+    # its style-only mode is gone (a Rewrite always cleans up).
+    switch -- $v { 2pass { set v 2 } 1pass { set v 1 } style { set v 2 } }
+    if {$v ni {1 2}} { set v 2 }
+    set ::PASSES $v
+    dbg "passes = $v"
 }
 
-proc savePipelineChoice {mode} {
+proc savePasses {v} {
     catch {
         file mkdir [file dirname $::STATE_PIPELINE_FILE]
-        set f [open $::STATE_PIPELINE_FILE w]; puts -nonewline $f $mode; close $f
+        set f [open $::STATE_PIPELINE_FILE w]; puts -nonewline $f $v; close $f
     }
 }
 
-proc on_pipeline_change {} {
-    set ::PIPELINE_MODE [pipeline_mode_for [.pane2.hdr.pipe get]]
-    savePipelineChoice $::PIPELINE_MODE
+proc on_passes_change {} {
+    savePasses $::PASSES
+    refresh_rewrite_controls
 }
 
 #==============================================================================
@@ -642,8 +647,8 @@ proc api_response_text {token} {
     return [normalize_text [string trim $content]]
 }
 
-# Run the styling pipeline in the picked mode (see ::PIPELINE_LABELS) on what
-# is currently in the source pane (the user may have edited the transcription/
+# Run the rewrite pipeline picked by ::STYLE_NAME and ::PASSES on what is
+# currently in the source pane (the user may have edited the transcription/
 # clipboard text); fall back to the variable when windowless.
 proc run_rewrite {} {
     set ::autosend_id ""
@@ -654,22 +659,19 @@ proc run_rewrite {} {
     set src [expr {[winfo exists .pane1.txt] ? [string trim [.pane1.txt get 1.0 end]] : $::sourceText}]
     set ::preprocessText ""
     set ::pipelineModel $::apiModel
-    switch -- $::PIPELINE_MODE {
-        2pass {
-            paneRewriteStatus "Preprocessing…"
-            api_call $::pipelineModel $::preprocessPrefix $src handle_preprocess
-        }
-        1pass {
-            paneRewriteStatus "Styling (thinking)…"
-            if {$::apiThinkingModel ne ""} { set ::pipelineModel $::apiThinkingModel }
-            # Thinking models can spend the completion budget on reasoning
-            # before the answer, so the merged call gets a larger cap.
-            api_call $::pipelineModel "${::mergedPassPrefix}\n${::styleGuide}" $src handle_rewrite 4000
-        }
-        default {
-            paneRewriteStatus "Styling…"
-            api_call $::pipelineModel "${::singlePassPrefix}\n${::styleGuide}" $src handle_rewrite
-        }
+    if {$::STYLE_NAME eq "none"} {
+        # No style: the clean-up call is the whole pipeline, so it terminates it.
+        paneRewriteStatus "Cleaning up…"
+        api_call $::pipelineModel $::preprocessPrefix $src handle_rewrite
+    } elseif {$::PASSES == 1} {
+        paneRewriteStatus "Rewriting (one merged call)…"
+        if {$::apiThinkingModel ne ""} { set ::pipelineModel $::apiThinkingModel }
+        # Thinking models can spend the completion budget on reasoning
+        # before the answer, so the merged call gets a larger cap.
+        api_call $::pipelineModel "${::mergedPassPrefix}\n${::styleGuide}" $src handle_rewrite 4000
+    } else {
+        paneRewriteStatus "Cleaning up (call 1 of 2)…"
+        api_call $::pipelineModel $::preprocessPrefix $src handle_preprocess
     }
 }
 
@@ -946,43 +948,83 @@ proc ui_error {msg {detail ""}} {
 set ::HL_COLOR "#cfe8ff"
 set ::PANE_BG  "#ffffff"
 
-# Style with the configured provider. With none configured, tell the user how to
-# add one instead of doing nothing, so the Style button stays meaningful in the
-# zero-config case rather than hiding (see the CLAUDE.md invariant).
-proc style_or_prompt {} {
+# Rewrite with the configured provider. With none configured, tell the user how
+# to add one instead of doing nothing, so the Rewrite button stays meaningful in
+# the zero-config case rather than hiding (see the CLAUDE.md invariant).
+proc rewrite_or_prompt {} {
     if {$::AI_AVAILABLE} { run_rewrite; return }
     set cfg [lindex [config_candidates] 0]
-    show_dialog "Styling needs an AI provider" \
+    show_dialog "Rewriting needs an AI provider" \
         "No AI provider is configured yet.\n\nAdd one to:\n$cfg\n\nSee config.example.ini for the format (any OpenAI-compatible endpoint, including a local Ollama model). Reopen Scribe once it is set."
+}
+
+# The passes row, hint line, and result placeholder all depend on the current
+# style/passes picks; one refresher keeps them consistent. Under "No style" the
+# passes row greys out rather than hides, so the layout never jumps and the
+# moot choice explains itself.
+proc refresh_rewrite_controls {} {
+    if {![winfo exists .ctrl]} return
+    set styled [expr {$::STYLE_NAME ne "none"}]
+    foreach w [winfo children .ctrl.passrow] {
+        if {[winfo class $w] in {TRadiobutton TLabel}} {
+            $w state [expr {$styled ? "!disabled" : "disabled"}]
+        }
+    }
+    .ctrl.hint configure -text [rewrite_hint]
+    if {$::rewriteState in {idle error}} { paneRewriteStatus [result_placeholder] }
+}
+proc rewrite_hint {} {
+    if {$::STYLE_NAME eq "none"} { return "No style selected → always a single clean-up pass (stutter, self-corrections, reordering)." }
+    if {$::PASSES == 1} { return "One call: clean-up and styling merged into a single prompt — suits thinking models." }
+    return "Two calls: clean up first, then apply the style to the cleaned text — most reliable."
+}
+proc result_placeholder {} {
+    if {$::STYLE_NAME eq "none"} { return "Press Rewrite to clean up the dictation." }
+    return "Press Rewrite to clean up and apply the $::STYLE_NAME style."
 }
 
 proc build_review_ui {} {
     wm title . "Scribe"
     set srcLabel [expr {$::INPUT eq "clipboard" ? "Clipboard" : ($::INPUT eq "voice" ? "Dictated" : "Text")}]
-    # The styled pane and its controls exist only when an AI provider is
+    # The rewrite controls and result pane exist only when an AI provider is
     # configured; with none, scribe shows a single dictation pane (see CLAUDE.md).
     set styleable $::AI_AVAILABLE
 
     pack [ttk::frame .pane1 -padding 6] -fill both -expand 1
-    pack [ttk::label .pane1.lbl -text $srcLabel] -anchor w
+    pack [ttk::frame .pane1.hdr] -fill x
+    pack [ttk::label .pane1.hdr.lbl -text $srcLabel] -side left
     text .pane1.txt -height 8 -width 80 -wrap word -relief solid -borderwidth 2 -takefocus 0
     pack .pane1.txt -fill both -expand 1
     bind .pane1.txt <Button-1> {setActiveArea 1}
 
     if {$styleable} {
+        pack [ttk::frame .ctrl -padding {6 0}] -fill x
+        pack [ttk::frame .ctrl.stylerow] -fill x
+        pack [ttk::label .ctrl.stylerow.lbl -text "Style" -width 7] -side left
+        pack [ttk::radiobutton .ctrl.stylerow.none -text "No style" -variable ::STYLE_NAME \
+                  -value none -command on_style_change -takefocus 0] -side left -padx {0 12}
+        set i 0
+        foreach name [styleNames] {
+            pack [ttk::radiobutton .ctrl.stylerow.s[incr i] -text $name -variable ::STYLE_NAME \
+                      -value $name -command on_style_change -takefocus 0] -side left -padx {0 12}
+        }
+        pack [ttk::frame .ctrl.passrow] -fill x -pady {4 0}
+        pack [ttk::label .ctrl.passrow.lbl -text "Passes" -width 7] -side left
+        pack [ttk::radiobutton .ctrl.passrow.p1 -text "1 — merged prompt" -variable ::PASSES \
+                  -value 1 -command on_passes_change -takefocus 0] -side left -padx {0 12}
+        pack [ttk::radiobutton .ctrl.passrow.p2 -text "2 — clean up, then style" -variable ::PASSES \
+                  -value 2 -command on_passes_change -takefocus 0] -side left -padx {0 12}
+        catch {
+            ttk::style configure Rewrite.TButton -foreground #ffffff -background #3584e4
+            ttk::style map Rewrite.TButton -background {active #1c5fad}
+        }
+        ttk::button .ctrl.passrow.rewrite -text "Rewrite" -style Rewrite.TButton \
+            -command rewrite_or_prompt -takefocus 0
+        pack .ctrl.passrow.rewrite -side right
+        pack [ttk::label .ctrl.hint -foreground #98989d] -fill x -pady {4 0}
+
         pack [ttk::frame .pane2 -padding 6] -fill both -expand 1
-        pack [ttk::frame .pane2.hdr] -anchor w -fill x
-        pack [ttk::label .pane2.hdr.lbl -text "Styled"] -side left
-        ttk::combobox .pane2.hdr.style -state readonly -width 12 \
-            -values [styleNames] -textvariable ::STYLE_NAME -takefocus 0
-        bind .pane2.hdr.style <<ComboboxSelected>> {on_style_change; focus .}
-        pack .pane2.hdr.style -side left -padx 6
-        # Pipeline picker: how the Style click runs (see ::PIPELINE_LABELS).
-        ttk::combobox .pane2.hdr.pipe -state readonly -width 10 \
-            -values [dict values $::PIPELINE_LABELS] -takefocus 0
-        .pane2.hdr.pipe set [pipeline_label $::PIPELINE_MODE]
-        bind .pane2.hdr.pipe <<ComboboxSelected>> {on_pipeline_change; focus .}
-        pack .pane2.hdr.pipe -side left
+        pack [ttk::label .pane2.lbl -text "Result"] -anchor w
         text .pane2.txt -height 8 -width 80 -wrap word -relief solid -borderwidth 2 -takefocus 0
         pack .pane2.txt -fill both -expand 1
         bind .pane2.txt <Button-1> {setActiveArea 2}
@@ -992,17 +1034,17 @@ proc build_review_ui {} {
     pack [ttk::frame .btns -padding 6] -fill x
     ttk::button .btns.go -text "$primary  (Space · Ctrl+↵ while editing)" -command {deliver_now [active_text] 0} -takefocus 0
     pack .btns.go -side left -padx 4
-    # The Style button is always offered so styling is discoverable; unconfigured,
-    # it points the user at config.ini rather than being hidden (see style_or_prompt).
-    ttk::button .btns.style -text "Style" -command {style_or_prompt} -takefocus 0
-    pack .btns.style -side left -padx 4
+    if {!$styleable} {
+        # Rewriting stays discoverable even unconfigured: the button points the
+        # user at config.ini rather than hiding (see rewrite_or_prompt).
+        ttk::button .btns.rewrite -text "Rewrite" -command rewrite_or_prompt -takefocus 0
+        pack .btns.rewrite -side left -padx 4
+    }
     ttk::button .btns.copy -text "Copy to clipboard" -command {set_clipboard [active_text]; finish 0} -takefocus 0
     pack .btns.copy -side left -padx 4
 
     .pane1.txt insert 1.0 $::sourceText
-    if {$styleable} {
-        if {!$::STYLE_ON} { paneRewriteStatus "Press Style to rewrite in the selected style." }
-    }
+    if {$styleable} { refresh_rewrite_controls }
 
     # Focus-dependent keys: when a text pane holds focus the Text class inserts the
     # character first (bindtags: {.paneN.txt Text . all}) and the guarded toplevel
@@ -1619,24 +1661,24 @@ proc run_self_test {} {
     if {$::AI_AVAILABLE} {
         loadSystemPrompts; loadStyle
         # Dictation-shaped source: a self-correction, a repetition, and a
-        # prerequisite recalled late, so the preprocess call has work to do.
+        # prerequisite recalled late, so the clean-up call has work to do.
         set ::sourceText "so the meeting moves to thursday, no wait, friday, the meeting moves to friday because the client called, oh and before that someone has to book the room"
-        foreach _mode {style 2pass 1pass} {
-            set _label [pipeline_label $_mode]
-            set ::PIPELINE_MODE $_mode
+        foreach {_style _passes _label} {none 2 clean-up-only clear 2 2-pass clear 1 1-pass} {
+            set ::STYLE_NAME $_style; loadStyle
+            set ::PASSES $_passes
             set ::rewriteState idle; set ::testDone 0
             run_rewrite
             set aid [after 65000 {set ::testDone timeout}]
             vwait ::testDone
             after cancel $aid
-            check "$_label pipeline returned" {$::rewriteState eq "done" && [string length $::rewriteText] > 0} "(state=$::rewriteState)"
-            if {$_mode eq "2pass"} {
-                check "2-pass preprocess call completed" {[string length $::preprocessText] > 0}
-                puts "    PREPROCESSED: $::preprocessText"
+            check "$_label rewrite returned" {$::rewriteState eq "done" && [string length $::rewriteText] > 0} "(state=$::rewriteState)"
+            if {$_label eq "2-pass"} {
+                check "2-pass clean-up call completed" {[string length $::preprocessText] > 0}
+                puts "    CLEANED: $::preprocessText"
             }
-            puts "    STYLED ($_label): $::rewriteText"
+            puts "    RESULT ($_label): $::rewriteText"
         }
-        set ::PIPELINE_MODE 2pass
+        set ::PASSES 2
     } else {
         puts "SKIP: style pass (no AI provider configured)"
     }
@@ -1675,10 +1717,15 @@ proc run_self_test {} {
     if {![catch {build_review_ui} e]} {
         set ok [expr {[winfo exists .pane1.txt] && [winfo exists .btns.go]}]
         if {$::AI_AVAILABLE} {
-            check "review UI builds (style controls present without --style)" \
-                {$ok && [winfo exists .pane2.txt] && [winfo exists .btns.style] && [winfo exists .pane2.hdr.style] && [winfo exists .pane2.hdr.pipe] && ![winfo exists .tip]}
+            check "review UI builds (rewrite controls present without --style)" \
+                {$ok && [winfo exists .pane2.txt] && [winfo exists .ctrl.stylerow.none] && [winfo exists .ctrl.passrow.p1] && [winfo exists .ctrl.passrow.rewrite] && ![winfo exists .btns.rewrite] && ![winfo exists .tip]}
+            # Under "No style" the passes row greys (moot choice), never hides.
+            set ::STYLE_NAME none; set ::styleGuide ""; refresh_rewrite_controls
+            check "passes row greys under No style" {[.ctrl.passrow.p1 instate disabled]}
+            set ::STYLE_NAME clear; refresh_rewrite_controls
+            check "passes row re-enables with a style" {[.ctrl.passrow.p1 instate !disabled]}
         } else {
-            check "review UI builds (single pane; Style button invites config)" {$ok && ![winfo exists .pane2.txt] && [winfo exists .btns.style] && ![winfo exists .tip]}
+            check "review UI builds (single pane; Rewrite button invites config)" {$ok && ![winfo exists .pane2.txt] && ![winfo exists .ctrl] && [winfo exists .btns.rewrite] && ![winfo exists .tip]}
         }
     } else { check "review UI builds" 0 "($e)" }
 
@@ -1704,17 +1751,23 @@ proc run_self_test {} {
     catch {file delete $::STATE_STYLE_FILE}
     set ::STATE_STYLE_FILE $_saveState
 
-    # Pipeline pick: round-trips through its state file and defaults to 2pass
-    # when none exists. Scratch file, so the real pick is untouched.
+    # Passes pick: round-trips through its state file, maps the former pipeline
+    # picker's values onto the passes axis, and defaults to 2 when no file
+    # exists. Scratch file, so the real pick is untouched.
     set _saveP $::STATE_PIPELINE_FILE
     set _scratchP [file join "/tmp" "scribe-selftest-[pid].pipeline"]
     set ::STATE_PIPELINE_FILE $_scratchP
-    savePipelineChoice 1pass
-    loadPipelineMode
-    check "pipeline pick persists and reloads" {$::PIPELINE_MODE eq "1pass"}
+    savePasses 1
+    loadPasses
+    check "passes pick persists and reloads" {$::PASSES == 1}
+    foreach {_legacy _expect} {2pass 2 1pass 1 style 2} {
+        set _fh [open $_scratchP w]; puts -nonewline $_fh $_legacy; close $_fh
+        loadPasses
+        check "former pipeline pick '$_legacy' maps to $_expect passes" {$::PASSES == $_expect}
+    }
     set ::STATE_PIPELINE_FILE [file join "/tmp" "scribe-selftest-[pid].absent"]
-    loadPipelineMode
-    check "pipeline pick defaults to 2pass" {$::PIPELINE_MODE eq "2pass"}
+    loadPasses
+    check "passes default to 2" {$::PASSES == 2}
     catch {file delete $_scratchP}
     set ::STATE_PIPELINE_FILE $_saveP
 
@@ -1755,7 +1808,7 @@ if {$::STYLE_ON && !$::AI_AVAILABLE} {
 # In a window the Style button is always offered when a provider is configured,
 # so load the guide and prompts whenever the feature is reachable; --no-window
 # needs them only when --style forces the pass.
-if {$::AI_AVAILABLE && ($::WINDOW || $::STYLE_ON)} { loadStyle; loadSystemPrompts; loadPipelineMode }
+if {$::AI_AVAILABLE && ($::WINDOW || $::STYLE_ON)} { loadStyle; loadSystemPrompts; loadPasses }
 
 if {$::SELF_TEST} { after idle run_self_test; vwait forever }
 if {$::TEST_TEXT ne ""} { after idle [list on_source_ready $::TEST_TEXT]; vwait forever }

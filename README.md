@@ -125,33 +125,36 @@ there is nothing to type into without a window.
 
 ## Review window
 
-When a window is shown it has two panes, the source text and the styled text,
-with one highlighted. The styled pane appears only when a provider is configured.
-Both panes are editable: click into one to correct the text before styling or
-delivering.
+When a window is shown it has two panes, the dictated text and the result,
+with one highlighted. The rewrite controls and the result pane appear only
+when a provider is configured. Both panes are editable: click into one to
+correct the text before rewriting or delivering.
 
-The styled pane's header holds two pickers: the style, and the pipeline a Style
-click runs. Both choices are remembered between runs, and unattended
-(`--no-window --style`) runs use them too.
+Between the panes, two rows of radios pick what a Rewrite click does. Both
+choices are remembered between runs, and unattended (`--no-window --style`)
+runs use them too.
 
-- **2-pass** (the default): a preprocess call first repairs what composing in
-  one take leaves behind: repeated versions of a point merged into the fullest
-  one, mid-stream self-corrections resolved, and points reordered into the
-  sequence the author would have chosen (a prerequisite recalled late moves
-  ahead of what depends on it). The style call then restyles the repaired
-  text. The source pane keeps the raw dictation; the styled pane shows the
-  repaired text until the styled text replaces it.
-- **1-pass**: one merged call does the repair and the styling together. Best
-  on a reasoning model: set `thinking_model` in the provider's config section,
-  otherwise the call goes to the provider's regular `model`.
-- **Style only**: the style call alone, no repair.
+- **Style**: "No style" (the default) runs the clean-up alone; picking a style
+  applies its guide on top of the clean-up. The clean-up repairs what
+  composing in one take leaves behind: repeated versions of a point merged
+  into the fullest one, mid-stream self-corrections resolved, and points
+  reordered into the sequence the author would have chosen (a prerequisite
+  recalled late moves ahead of what depends on it).
+- **Passes** (greyed under "No style", where it is moot): **2 — clean up,
+  then style** (the default) repairs first, then restyles the repaired text;
+  the source pane keeps the raw dictation, and the result pane shows the
+  repaired text until the styled text replaces it. **1 — merged prompt** does
+  both in one call. Best on a reasoning model: set `thinking_model` in the
+  provider's config section, otherwise the call goes to the provider's
+  regular `model`.
 
 The keys depend on focus. With the window itself focused (as it opens after voice
 or clipboard input), Space delivers, Enter delivers and then sends a return, and
 Up/Down switch the highlighted pane. Once you click into a pane to edit, Space and
-Enter type normally; deliver with Ctrl+Enter or the button. Escape (or the second
-button) copies to the clipboard and closes without pasting. In keyboard mode the
-window opens with the cursor already in the pane, ready to type.
+Enter type normally; deliver with Ctrl+Enter or the button. Escape closes without
+pasting; closing the window (or the Copy button) copies to the clipboard first.
+In keyboard mode the window opens with the cursor already in the pane, ready to
+type.
 
 ## Text normalisation
 

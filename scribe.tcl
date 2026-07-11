@@ -25,8 +25,8 @@ package require Tk 9
 #   Keystrokes: dotool (Linux, uinput); osascript System Events (macOS).
 #   Clipboard : wl-copy under Wayland, xclip under X11, pbcopy on macOS.
 #
-# The style pass is optional. AI providers are configured in config.toml
-# (~/.config/scribe/config.toml): a [provider.NAME] table per provider plus a
+# The style pass is optional. AI providers are configured in config.ini
+# (~/.config/scribe/config.ini): a [provider.NAME] section per provider plus a
 # top-level default_provider; --provider NAME overrides the default. With no
 # config and no keys, scribe still runs as a dictation tool — the style pass and
 # the styled review pane are simply absent (see CLAUDE.md).
@@ -88,7 +88,7 @@ set ::TEST_TEXT        ""
 set ::TEST_FILE        ""
 set ::SELF_TEST        0
 
-# --- AI provider (resolved from config.toml; optional) ---
+# --- AI provider (resolved from config.ini; optional) ---
 set ::PROVIDER     ""        ;# CLI override of which [provider.NAME] to use
 set ::AI_AVAILABLE 0         ;# 1 once a provider with an api_key resolves
 set ::apiKey  ""
@@ -178,7 +178,7 @@ for {set i 0} {$i < [llength $::argv]} {incr i} {
             puts "  --window | --no-window         draw the review window, or run unattended"
             puts "  --deliver type|paste|clipboard how the result leaves (default paste)"
             puts "  --style                        (no-window) style the text; a window offers styling whenever a provider is configured"
-            puts "  --provider NAME                use \[provider.NAME\] from config.toml (else default_provider)"
+            puts "  --provider NAME                use \[provider.NAME\] from config.ini (else default_provider)"
             puts "  --auto-style-delay MS          (window) auto-style after MS ms; 1 = immediate"
             puts "  --quotes double|single|straight   double: “ ” · single: ‘ ’ · straight: ASCII"
             puts "  --dialect off|british          british: US→UK spelling; default quotes -> single"
@@ -226,13 +226,13 @@ proc transcribe_error_msg {tail} {
 # CONFIG LOADING
 #==============================================================================
 
-# Minimal TOML reader for scribe's config: [section] / [a.b] headers and
+# Minimal INI reader for scribe's config: [section] / [a.b] headers and
 # key = value lines, values optionally "double" or 'single' quoted (a bare value
-# has any trailing # comment stripped). Enough for provider tables plus the
-# top-level default_provider; not a general TOML parser (no arrays, inline tables,
-# or multiline strings — scribe's config needs none). Returns a dict keyed by
-# section name (top-level keys live under ""), each value a dict of key->value.
-proc parse_toml {data} {
+# has any trailing # comment stripped). Enough for provider sections plus the
+# top-level default_provider. A deliberately small subset: no value continuation,
+# # comments only, which is all scribe's config needs. Returns a dict keyed by section
+# name (top-level keys live under ""), each value a dict of key->value.
+proc parse_ini {data} {
     set sections [dict create "" [dict create]]
     set cur ""
     foreach raw [split $data \n] {
@@ -257,10 +257,10 @@ proc parse_toml {data} {
 # Candidate config paths, in order: XDG user config, then the app dir (dev).
 proc config_candidates {} {
     set xdg [expr {[info exists ::env(XDG_CONFIG_HOME)] && $::env(XDG_CONFIG_HOME) ne "" ? $::env(XDG_CONFIG_HOME) : "$::env(HOME)/.config"}]
-    return [list [file join $xdg scribe config.toml] [file join $::APP_DIR config.toml]]
+    return [list [file join $xdg scribe config.ini] [file join $::APP_DIR config.ini]]
 }
 
-# Resolve an AI provider from config.toml, if one is configured. This NEVER
+# Resolve an AI provider from config.ini, if one is configured. This NEVER
 # fatals: scribe must run as a dictation tool with no config and no keys (see
 # CLAUDE.md). On success sets ::AI_AVAILABLE 1 and ::apiKey/::apiBase/::apiModel;
 # otherwise leaves ::AI_AVAILABLE 0 and the style pass stays disabled.
@@ -273,13 +273,13 @@ proc loadConfig {} {
     if {[catch {set fh [open $path r]; set data [read $fh]; close $fh} err]} {
         logsys warning "cannot read config $path: $err — running without AI"; return
     }
-    set toml [parse_toml $data]
+    set ini [parse_ini $data]
     set providers [dict create]
-    dict for {sec kv} $toml {
+    dict for {sec kv} $ini {
         if {[regexp {^provider\.(.+)$} $sec -> pname]} { dict set providers [string trim $pname] $kv }
     }
     set choice $::PROVIDER
-    if {$choice eq "" && [dict exists $toml "" default_provider]} { set choice [dict get $toml "" default_provider] }
+    if {$choice eq "" && [dict exists $ini "" default_provider]} { set choice [dict get $ini "" default_provider] }
     if {$choice eq "" && [dict size $providers] == 1} { set choice [lindex [dict keys $providers] 0] }
     if {$choice eq ""} { dbg "no provider selected in $path — running without AI"; return }
     if {![dict exists $providers $choice]} {
@@ -297,7 +297,7 @@ proc loadConfig {} {
 }
 
 # Backward compatibility: the pre-0.6.1 single-provider deepseek.json in the app
-# dir, used when no config.toml is present.
+# dir, used when no config.ini is present.
 proc loadLegacyDeepseek {} {
     if {![file exists $::DEEPSEEK_CONFIG]} return
     if {[catch {
@@ -750,6 +750,18 @@ proc ui_error {msg {detail ""}} {
 set ::HL_COLOR "#cfe8ff"
 set ::PANE_BG  "#ffffff"
 
+# Style with the configured provider. With none configured, tell the user how to
+# add one instead of doing nothing, so the Style button stays meaningful in the
+# zero-config case rather than hiding (see the CLAUDE.md invariant).
+proc style_or_prompt {} {
+    if {$::AI_AVAILABLE} { run_rewrite; return }
+    set cfg [lindex [config_candidates] 0]
+    tk_messageBox -parent . -type ok -icon info \
+        -title "Styling needs an AI provider" \
+        -message "No AI provider is configured yet." \
+        -detail "Add one to:\n$cfg\n\nSee config.example.ini for the format — any OpenAI-compatible endpoint, including a local Ollama model. Reopen Scribe once it is set."
+}
+
 proc build_review_ui {} {
     wm title . "Scribe"
     set srcLabel [expr {$::INPUT eq "clipboard" ? "Clipboard" : ($::INPUT eq "voice" ? "Dictated" : "Text")}]
@@ -780,20 +792,12 @@ proc build_review_ui {} {
     pack [ttk::frame .btns -padding 6] -fill x
     ttk::button .btns.go -text "$primary  (Space · Ctrl+↵ while editing)" -command {deliver_now [active_text] 0} -takefocus 0
     pack .btns.go -side left -padx 4
-    if {$styleable} {
-        ttk::button .btns.style -text "Style" -command {run_rewrite} -takefocus 0
-        pack .btns.style -side left -padx 4
-    }
+    # The Style button is always offered so styling is discoverable; unconfigured,
+    # it points the user at config.ini rather than being hidden (see style_or_prompt).
+    ttk::button .btns.style -text "Style" -command {style_or_prompt} -takefocus 0
+    pack .btns.style -side left -padx 4
     ttk::button .btns.copy -text "Copy to clipboard" -command {set_clipboard [active_text]; finish 0} -takefocus 0
     pack .btns.copy -side left -padx 4
-
-    # With no AI provider the Style control is absent; a muted footer tip says why
-    # and how to enable it, so its absence reads as configuration, not a fault.
-    if {!$styleable} {
-        pack [ttk::label .tip -anchor w -justify left -foreground "#666666" -wraplength 520 \
-            -text "No AI provider configured, so styling is unavailable. Add a provider in config.toml to enable the style pass."] \
-            -fill x -padx 10 -pady {0 6}
-    }
 
     .pane1.txt insert 1.0 $::sourceText
     if {$styleable} {
@@ -1234,10 +1238,10 @@ proc run_self_test {} {
         check "recorder prefers pw-record" {[resolve_recorder] eq "pw-record"}
     }
 
-    set _toml [parse_toml "default_provider = \"x\"\n# a comment\n\[provider.x\]\napi_key = \"k\"\nmodel = 'm'  # inline\n"]
-    check "toml default_provider" {[dict get $_toml "" default_provider] eq "x"}
-    check "toml provider table"   {[dict get $_toml "provider.x" api_key] eq "k"}
-    check "toml single-quote val" {[dict get $_toml "provider.x" model] eq "m"}
+    set _ini [parse_ini "default_provider = \"x\"\n# a comment\n\[provider.x\]\napi_key = \"k\"\nmodel = 'm'  # inline\n"]
+    check "ini default_provider" {[dict get $_ini "" default_provider] eq "x"}
+    check "ini provider section"  {[dict get $_ini "provider.x" api_key] eq "k"}
+    check "ini single-quote val"  {[dict get $_ini "provider.x" model] eq "m"}
 
     set ::sourceText "src"; set ::rewriteText "rw"; setActiveArea 1
     check "active=source pane1" {[active_text] eq "src"}
@@ -1278,7 +1282,7 @@ proc run_self_test {} {
             check "review UI builds (style controls present without --style)" \
                 {$ok && [winfo exists .pane2.txt] && [winfo exists .btns.style] && [winfo exists .pane2.hdr.style] && ![winfo exists .tip]}
         } else {
-            check "review UI builds (dictation only, tip explains no AI)" {$ok && ![winfo exists .pane2.txt] && ![winfo exists .btns.style] && [winfo exists .tip]}
+            check "review UI builds (single pane; Style button invites config)" {$ok && ![winfo exists .pane2.txt] && [winfo exists .btns.style] && ![winfo exists .tip]}
         }
     } else { check "review UI builds" 0 "($e)" }
 

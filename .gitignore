@@ -1,4 +1,6 @@
 deepseek.json
+config.ini
+# pre-INI local config; scribe reads config.ini now, but keep the old name ignored
 config.toml
 current-mode.conf
 language-stylist.log

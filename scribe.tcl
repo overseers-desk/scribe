@@ -116,6 +116,7 @@ set ::tmpfile       ""
 set ::log_stem      ""
 set ::auto_stop_id  ""
 set ::poll_id       ""
+set ::wdog_id       ""          ;# local-transcription watchdog timer
 set ::start_ms      0
 set ::state         idle
 set ::done          0
@@ -1165,11 +1166,11 @@ proc sweep_stale_recordings {} {
         if {[catch {exec kill -0 $opid}]} { catch {file delete -- $f} }
     }
 }
+# The .wav half of the pair is written by transcribe, ahead of the attempt.
 proc save_log {text} {
     if {$::log_stem eq ""} return
     if {[catch {file mkdir $::LOG_DIR}]} return
     catch {
-        if {[file exists $::tmpfile]} { file copy -force -- $::tmpfile [file join $::LOG_DIR "$::log_stem.wav"] }
         set fh [open [file join $::LOG_DIR "$::log_stem.txt"] w]; puts -nonewline $fh $text; close $fh
     }
 }
@@ -1216,6 +1217,16 @@ proc transcribe {} {
     # The --test-file path reaches here without start_recording, so ensure the
     # cache dir (home of the stderr file below) exists on both paths.
     file mkdir $::CACHE_DIR
+    # The audio reaches the dictation log before any transcription attempt: a
+    # hung, killed, or crashed run must not cost the recording (the cache copy
+    # is swept by the next instance). save_log adds the .txt beside it on
+    # success. No log_stem means no recording of ours (--test-file).
+    if {$::log_stem ne ""} {
+        catch {
+            file mkdir $::LOG_DIR
+            file copy -force -- $::tmpfile [file join $::LOG_DIR "$::log_stem.wav"]
+        }
+    }
     if {[transcribe_use_server]} { transcribe_server } else { transcribe_local }
 }
 proc transcribe_use_server {} { expr {$::WHISPER_SERVER ne ""} }
@@ -1248,10 +1259,25 @@ proc transcribe_local {} {
     set ::wbuf ""
     fconfigure $::wchan -blocking 0
     fileevent $::wchan readable transcribe_collect
+    # Watchdog, sized to the audio (16kHz mono s16 = 32kB/s) plus the server
+    # path's request cap, so a CPU run on a long recording is never killed while
+    # it still makes progress. Without one, a wedged whisper-cli (GPU held by
+    # another model, driver fault) hangs scribe forever with no error and no
+    # transcript.
+    set audio_s [expr {int([file size $::tmpfile] / 32000.0)}]
+    set ::wdog_id [after [expr {($::WHISPER_TIMEOUT_S + $audio_s) * 1000}] transcribe_local_timeout]
+}
+proc transcribe_local_timeout {} {
+    set ::wdog_id ""
+    logsys err "whisper-cli still running after its ${::WHISPER_TIMEOUT_S}s-plus-audio budget; killing it"
+    # The kill surfaces as EOF plus a nonzero close in transcribe_collect,
+    # which reports through the normal failure path (dialog + log).
+    catch { foreach p [pid $::wchan] { exec kill $p } }
 }
 proc transcribe_collect {} {
     append ::wbuf [read $::wchan]
     if {![eof $::wchan]} return
+    if {$::wdog_id ne ""} { after cancel $::wdog_id; set ::wdog_id "" }
     fileevent $::wchan readable {}
     # A non-blocking channel's close does not wait for the child or report its
     # exit status, so whisper-cli failures (missing model, GPU OOM) would pass

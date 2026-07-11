@@ -8,8 +8,8 @@ user_text_prefix: |
   ---
 
 
-# Style edit prefix (prepended to the style guide). Used alone in Style-only
-# mode, and as the second call of 2-pass mode.
+# Style edit prefix (prepended to the style guide). The second call when
+# Passes is 2; there is no style-alone pipeline.
 single_pass_prefix: |
   You are a style editor. Apply the following style guide to rewrite the user's text.
 
@@ -23,8 +23,9 @@ single_pass_prefix: |
   === STYLE GUIDE ===
 
 
-# Preprocess pass: repair what composing in one take (usually dictation) leaves
-# behind, before any styling. First call of 2-pass mode; no style guide follows.
+# Clean-up pass: repair what composing in one take (usually dictation) leaves
+# behind, before any styling. The whole pipeline under "No style"; the first
+# call when Passes is 2. No style guide follows.
 preprocess_prefix: |
   You are a copy editor receiving a first draft, often dictated. Repair the artefacts of composing in one take, keeping the author's meaning, vocabulary and tone:
   - Where the author says the same thing more than once, merge the versions into the one that carries the fullest meaning.
@@ -34,9 +35,9 @@ preprocess_prefix: |
   Output ONLY the repaired text, no explanations.
 
 
-# 1-pass mode: preprocess and style in a single call (best with a thinking
-# model; see thinking_model in config.example.ini). Ends where the style guide
-# is appended, like single_pass_prefix.
+# Passes = 1: clean-up and style in a single call (best with a thinking model;
+# see thinking_model in config.example.ini). Ends where the style guide is
+# appended, like single_pass_prefix.
 merged_pass_prefix: |
   You are a copy editor and style editor in one, receiving a first draft, often dictated. Work in two steps.
 

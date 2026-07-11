@@ -210,7 +210,8 @@ supplies a throwaway one.
 wish9.0 scribe.tcl --self-test
 ```
 
-Runs the quote, dialect, injection, delivery, validation, styling-pipeline
-(all three modes, when a provider is configured), clipboard, and UI checks
-without a microphone, and exits with the result.
+Runs the quote, dialect, injection, delivery, validation, rewrite-pipeline
+(all three style/passes combinations, when a provider is configured),
+second-press protocol, clipboard, and UI checks without a microphone, and
+exits with the result.
 `--test-text "…"` drives the window with fixed text instead of the mic.

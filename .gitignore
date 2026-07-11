@@ -4,3 +4,5 @@ config.ini
 config.toml
 current-mode.conf
 language-stylist.log
+# local agent state and worktrees (never part of the project)
+.claude/

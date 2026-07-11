@@ -5,9 +5,10 @@
 Scribe must work as a plain dictation tool when there is **no `config.ini` and no
 API key of any kind**. This is a hard invariant — do not break it.
 
-- Any input source (typed into the window, dictated via `--input voice`, or grabbed
-  with `--input clipboard`) → normalisation (quotes, dialect) → delivery (type /
-  paste / clipboard) must always work, on its own, with zero configuration.
+- Any input source (typed into the window, dictated via `--input voice` or the
+  window's Listen button, or grabbed with `--input clipboard`) → normalisation
+  (quotes, dialect) → delivery (type / paste / clipboard) must always work, on
+  its own, with zero configuration.
 - The AI **style pass is strictly additive**. It is the only feature that needs a
   provider. When none is configured:
   - never `fatal` / never exit non-zero because config or a key is missing;

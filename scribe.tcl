@@ -118,6 +118,8 @@ set ::auto_stop_id  ""
 set ::poll_id       ""
 set ::wdog_id       ""          ;# local-transcription watchdog timer
 set ::transcribe_ms 0           ;# when the transcription attempt began
+set ::capture_sink  launch      ;# launch: transcript builds/fills the window; window: it lands in the open pane
+set ::win_pulse_id  ""          ;# in-window recording indicator pulse timer
 set ::start_ms      0
 set ::state         idle
 set ::done          0
@@ -889,6 +891,10 @@ proc cancel_pending {} {
 proc finish {code} {
     logsys notice "exit $code"
     catch {after cancel $::autosend_id}
+    # The window can close mid-capture (Listen running): take the recorder and
+    # any in-flight whisper-cli with it, or the mic stays hot in an orphan.
+    if {$::recorder_pid > 0} { catch {exec kill $::recorder_pid} }
+    catch { if {[info exists ::wchan]} { foreach p [pid $::wchan] { exec kill $p } } }
     catch {tk systray destroy}
     if {$::tmpfile ne "" && $::TEST_FILE eq "" && !$::debug_mode} { catch {file delete $::tmpfile} }
     after 0 [list exit $code]
@@ -930,6 +936,13 @@ proc show_dialog {title body} {
 # differ — so scribe reports the backend's own failure rather than guessing.
 proc ui_error {msg {detail ""}} {
     logsys err "$msg[expr {$detail ne "" ? " ($detail)" : ""}]"
+    # A failure inside an in-window recording (recorder, transcription) costs
+    # the attempt, not the window: the pane may hold typed work.
+    if {$::capture_sink eq "window"} {
+        win_capture_reset
+        catch {show_dialog "Scribe" $msg}
+        return
+    }
     catch {tk systray destroy}
     if {$::WINDOW} {
         # Keep the dialog readable: show the short human message, never the raw
@@ -993,6 +1006,11 @@ proc build_review_ui {} {
     pack [ttk::frame .pane1 -padding 6] -fill both -expand 1
     pack [ttk::frame .pane1.hdr] -fill x
     pack [ttk::label .pane1.hdr.lbl -text $srcLabel] -side left
+    # In-window dictation, whatever --input opened the window: Listen records
+    # into this pane; while recording it reads Stop and the indicator pulses.
+    ttk::label .pane1.hdr.rec -foreground #e01b24 -text "● recording…"
+    ttk::button .pane1.hdr.listen -text "Listen" -command win_listen_toggle -takefocus 0
+    pack .pane1.hdr.listen -side right
     text .pane1.txt -height 8 -width 80 -wrap word -relief solid -borderwidth 2 -takefocus 0
     pack .pane1.txt -fill both -expand 1
     bind .pane1.txt <Button-1> {setActiveArea 1}
@@ -1053,7 +1071,7 @@ proc build_review_ui {} {
     bind . <space>          {if {![typing_focus]} {deliver_now [active_text] 0; break}}
     bind . <Return>         {if {![typing_focus]} {deliver_now [active_text] 1; break}}
     bind . <Control-Return> {deliver_now [active_text] 0; break}
-    bind . <Escape>         {finish 0; break}
+    bind . <Escape>         {if {$::state eq "recording"} {stop_recording escape} else {finish 0}; break}
     if {$styleable} {
         bind . <Up>   {if {![typing_focus]} {setActiveArea 1; break}}
         bind . <Down> {if {![typing_focus]} {setActiveArea 2; break}}
@@ -1061,6 +1079,73 @@ proc build_review_ui {} {
     wm protocol . WM_DELETE_WINDOW {set_clipboard [active_text]; finish 0}
     refresh_highlight
 }
+# In-window dictation. Listen starts the same recorder the voice launch path
+# uses; ::capture_sink routes the transcript into the open pane instead of
+# through on_source_ready. The listener socket is served while recording, so
+# the global shortcut's second press stops this recording like any other.
+proc win_listen_toggle {} {
+    if {$::capture_sink eq "window"} {
+        # A capture is already in flight: recording toggles to stop, a
+        # transcription just waits. (::state alone cannot gate this: a window
+        # opened by the voice launch path keeps its "transcribing" residue.)
+        if {$::state eq "recording"} { stop_recording window-stop }
+        return
+    }
+    set ::capture_sink window
+    set ::done 0
+    serve_listener
+    start_recording
+    if {$::recorder_pid == 0} { win_capture_reset; return }
+    set ::state recording
+    win_update_rec_ui
+}
+# The transcript lands in the source pane: appended when the pane holds text
+# (typed work is kept), replacing the pane when it is empty. The pane is the
+# source of truth, so ::sourceText follows it.
+proc win_capture_done {text} {
+    win_capture_reset
+    set text [normalize_text [string trim $text]]
+    if {$text eq ""} return
+    set cur [string trim [.pane1.txt get 1.0 end]]
+    if {$cur ne ""} { set text "$cur $text" }
+    .pane1.txt delete 1.0 end
+    .pane1.txt insert 1.0 $text
+    set ::sourceText $text
+    setActiveArea 1
+}
+proc win_capture_reset {} {
+    set ::capture_sink launch
+    set ::done 0
+    stop_listener
+    stop_animate
+    if {$::state ne "idle"} { set ::state idle }
+    win_update_rec_ui
+}
+proc win_update_rec_ui {} {
+    if {![winfo exists .pane1.hdr.listen]} return
+    if {$::capture_sink eq "window" && $::state eq "recording"} {
+        .pane1.hdr.listen configure -text "Stop  (Esc)"
+        pack .pane1.hdr.rec -side left -padx 8 -after .pane1.hdr.lbl
+        if {$::win_pulse_id eq ""} { win_rec_pulse }
+        return
+    }
+    if {$::win_pulse_id ne ""} { after cancel $::win_pulse_id; set ::win_pulse_id "" }
+    pack forget .pane1.hdr.rec
+    if {$::capture_sink eq "window"} {
+        .pane1.hdr.listen configure -text "Transcribing…"
+        .pane1.hdr.listen state disabled
+    } else {
+        .pane1.hdr.listen configure -text "Listen"
+        .pane1.hdr.listen state !disabled
+    }
+}
+proc win_rec_pulse {} {
+    if {![winfo exists .pane1.hdr.rec] || $::state ne "recording"} { set ::win_pulse_id ""; return }
+    set lit [expr {[.pane1.hdr.rec cget -foreground] eq "#e01b24"}]
+    .pane1.hdr.rec configure -foreground [expr {$lit ? "#f2b0b4" : "#e01b24"}]
+    set ::win_pulse_id [after 600 win_rec_pulse]
+}
+
 proc paneSetRewrite {txt} {
     if {![winfo exists .pane2.txt]} return
     .pane2.txt delete 1.0 end; .pane2.txt insert 1.0 $txt
@@ -1186,7 +1271,7 @@ proc animate {} {
 }
 proc start_animate {} { if {$::anim_id eq ""} animate }
 proc stop_animate {}  { if {$::anim_id ne ""} { after cancel $::anim_id; set ::anim_id "" } }
-proc enter_state {newstate} { stop_animate; set ::state $newstate; set ::blink 1; start_animate }
+proc enter_state {newstate} { stop_animate; set ::state $newstate; set ::blink 1; start_animate; win_update_rec_ui }
 
 #==============================================================================
 # VOICE INPUT
@@ -1404,7 +1489,7 @@ proc transcribe_succeeded {text} {
         logsys warning "transcription is empty (silence, wrong audio format, or wrong model?)"
     }
     catch {save_log $text}
-    on_source_ready $text
+    if {$::capture_sink eq "window"} { win_capture_done $text } else { on_source_ready $text }
 }
 proc poll_recorder {} {
     if {$::recorder_pid == 0} return
@@ -1718,14 +1803,14 @@ proc run_self_test {} {
         set ok [expr {[winfo exists .pane1.txt] && [winfo exists .btns.go]}]
         if {$::AI_AVAILABLE} {
             check "review UI builds (rewrite controls present without --style)" \
-                {$ok && [winfo exists .pane2.txt] && [winfo exists .ctrl.stylerow.none] && [winfo exists .ctrl.passrow.p1] && [winfo exists .ctrl.passrow.rewrite] && ![winfo exists .btns.rewrite] && ![winfo exists .tip]}
+                {$ok && [winfo exists .pane2.txt] && [winfo exists .ctrl.stylerow.none] && [winfo exists .ctrl.passrow.p1] && [winfo exists .ctrl.passrow.rewrite] && [winfo exists .pane1.hdr.listen] && ![winfo exists .btns.rewrite] && ![winfo exists .tip]}
             # Under "No style" the passes row greys (moot choice), never hides.
             set ::STYLE_NAME none; set ::styleGuide ""; refresh_rewrite_controls
             check "passes row greys under No style" {[.ctrl.passrow.p1 instate disabled]}
             set ::STYLE_NAME clear; refresh_rewrite_controls
             check "passes row re-enables with a style" {[.ctrl.passrow.p1 instate !disabled]}
         } else {
-            check "review UI builds (single pane; Rewrite button invites config)" {$ok && ![winfo exists .pane2.txt] && ![winfo exists .ctrl] && [winfo exists .btns.rewrite] && ![winfo exists .tip]}
+            check "review UI builds (single pane; Rewrite button invites config)" {$ok && ![winfo exists .pane2.txt] && ![winfo exists .ctrl] && [winfo exists .btns.rewrite] && [winfo exists .pane1.hdr.listen] && ![winfo exists .tip]}
         }
     } else { check "review UI builds" 0 "($e)" }
 

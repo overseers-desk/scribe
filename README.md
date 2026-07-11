@@ -130,6 +130,12 @@ with one highlighted. The rewrite controls and the result pane appear only
 when a provider is configured. Both panes are editable: click into one to
 correct the text before rewriting or delivering.
 
+A **Listen** button in the pane header records from the window itself: press,
+dictate, and press again (or Escape) to stop. The transcript lands in the
+pane, appended after any text already there. It covers windows opened without
+`--input voice`, and the global shortcut's second press stops it like any
+other recording.
+
 Between the panes, two rows of radios pick what a Rewrite click does. Both
 choices are remembered between runs, and unattended (`--no-window --style`)
 runs use them too.

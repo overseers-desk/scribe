@@ -129,6 +129,22 @@ with one highlighted. The styled pane appears only when a provider is configured
 Both panes are editable: click into one to correct the text before styling or
 delivering.
 
+The styled pane's header holds two pickers: the style, and the pipeline a Style
+click runs. Both choices are remembered between runs, and unattended
+(`--no-window --style`) runs use them too.
+
+- **2-pass** (the default): a preprocess call first repairs what composing in
+  one take leaves behind: repeated versions of a point merged into the fullest
+  one, mid-stream self-corrections resolved, and points reordered into the
+  sequence the author would have chosen (a prerequisite recalled late moves
+  ahead of what depends on it). The style call then restyles the repaired
+  text. The source pane keeps the raw dictation; the styled pane shows the
+  repaired text until the styled text replaces it.
+- **1-pass**: one merged call does the repair and the styling together. Best
+  on a reasoning model: set `thinking_model` in the provider's config section,
+  otherwise the call goes to the provider's regular `model`.
+- **Style only**: the style call alone, no repair.
+
 The keys depend on focus. With the window itself focused (as it opens after voice
 or clipboard input), Space delivers, Enter delivers and then sends a return, and
 Up/Down switch the highlighted pane. Once you click into a pane to edit, Space and
@@ -160,6 +176,7 @@ window opens with the cursor already in the pane, ready to type.
 wish9.0 scribe.tcl --self-test
 ```
 
-Runs the quote, dialect, injection, delivery, validation, style-pass,
-clipboard, and UI checks without a microphone, and exits with the result.
+Runs the quote, dialect, injection, delivery, validation, styling-pipeline
+(all three modes, when a provider is configured), clipboard, and UI checks
+without a microphone, and exits with the result.
 `--test-text "…"` drives the window with fixed text instead of the mic.

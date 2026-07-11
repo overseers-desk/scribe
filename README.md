@@ -10,7 +10,7 @@ will happen:
 ```
 --input keyboard|voice|clipboard where the text comes from (default keyboard)
 --window | --no-window           show a review window, or run unattended
---deliver type|paste|clipboard   how the result leaves
+--deliver type|paste|clipboard|stdout  how the result leaves (stdout prints it)
 --style[=NAME]                   apply a style pass (needs a configured AI provider)
 --provider NAME                  pick a [provider.NAME] from config.ini
 --quotes double|single|straight  quotation style (default double)
@@ -188,6 +188,12 @@ fallback_local = true                # if it is down, use whisper-cli
 You run the server yourself (scribe only reaches the URL); server mode needs
 `curl`. With `fallback_local`, keep a valid `--model` so the local path can take
 over. Omit `[whisper]` to transcribe locally as before.
+
+To test the loop headlessly (e.g. over SSH, where there is no display), pair
+`--deliver stdout` with a virtual display: `xvfb-run -a scribe.tcl --input voice
+--test-file sample.wav --no-window --deliver stdout` prints the transcript instead
+of typing or pasting it. scribe is a Tk app, so it still needs a display; `xvfb-run`
+supplies a throwaway one.
 
 ## Self-test
 

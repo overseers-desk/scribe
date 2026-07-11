@@ -7,7 +7,7 @@ package require Tk 9
 # Behaviour is five independent axes; reading the flags tells the whole story:
 #   --input  keyboard | voice | clipboard  where the text comes from (default keyboard)
 #   --window | --no-window                 review window, or unattended
-#   --deliver type | paste | clipboard     how the result leaves
+#   --deliver type | paste | clipboard | stdout   how the result leaves (stdout: print it)
 #   --style                                (no-window) style the text; a window always offers styling
 #   --quotes double|single|straight  --dialect off|british   normalisation
 #
@@ -192,7 +192,7 @@ for {set i 0} {$i < [llength $::argv]} {incr i} {
             puts "Usage: scribe \[options\]"
             puts "  --input keyboard|voice|clipboard  source (default keyboard; --no-window needs voice|clipboard)"
             puts "  --window | --no-window         draw the review window, or run unattended"
-            puts "  --deliver type|paste|clipboard how the result leaves (default paste)"
+            puts "  --deliver type|paste|clipboard|stdout  how the result leaves (default paste; stdout prints it, for headless runs)"
             puts "  --style                        (no-window) style the text; a window offers styling whenever a provider is configured"
             puts "  --provider NAME                use \[provider.NAME\] from config.ini (else default_provider)"
             puts "  --auto-style-delay MS          (window) auto-style after MS ms; 1 = immediate"
@@ -847,6 +847,7 @@ proc deliver_now {text {withEnter 0}} {
     # land the prior clipboard. Skip the window poke entirely, as the windowless
     # typing path always has.
     switch -- $::DELIVER {
+        stdout { puts $text; flush stdout; finish 0 }
         clipboard { set_clipboard $text; finish 0 }
         type {
             if {$::WINDOW} { catch {wm withdraw .}; after 150 [list inject_text $text] } \
@@ -982,7 +983,7 @@ proc build_review_ui {} {
         bind .pane2.txt <Button-1> {setActiveArea 2}
     }
 
-    set primary [expr {$::DELIVER eq "type" ? "Type" : ($::DELIVER eq "clipboard" ? "Copy" : "Paste")}]
+    set primary [expr {$::DELIVER eq "type" ? "Type" : ($::DELIVER eq "clipboard" ? "Copy" : ($::DELIVER eq "stdout" ? "Print" : "Paste"))}]
     pack [ttk::frame .btns -padding 6] -fill x
     ttk::button .btns.go -text "$primary  (Space · Ctrl+↵ while editing)" -command {deliver_now [active_text] 0} -takefocus 0
     pack .btns.go -side left -padx 4
@@ -1627,7 +1628,7 @@ proc run_self_test {} {
 wm withdraw .
 
 if {$::INPUT ni {keyboard voice clipboard ""}} { fatal "--input must be keyboard, voice, or clipboard" }
-if {$::DELIVER ni {type paste clipboard}} { fatal "--deliver must be type, paste, or clipboard" }
+if {$::DELIVER ni {type paste clipboard stdout}} { fatal "--deliver must be type, paste, clipboard, or stdout" }
 if {$::QUOTES ni {"" double single straight}} { fatal "--quotes must be double, single, or straight" }
 if {$::DIALECT ni {off british}} { fatal "--dialect must be off or british" }
 if {$::STYLE_AUTO ne "" && ![string is integer -strict $::STYLE_AUTO]} { fatal "--auto-style-delay must be an integer (ms)" }

@@ -117,6 +117,7 @@ set ::log_stem      ""
 set ::auto_stop_id  ""
 set ::poll_id       ""
 set ::wdog_id       ""          ;# local-transcription watchdog timer
+set ::transcribe_ms 0           ;# when the transcription attempt began
 set ::start_ms      0
 set ::state         idle
 set ::done          0
@@ -842,6 +843,7 @@ proc poll_inject {} {
 
 proc deliver_now {text {withEnter 0}} {
     cancel_pending
+    logsys notice "delivering [string length $text] chars via $::DELIVER"
     # In window mode, hide the review window first so focus returns to the prior
     # window before we type/paste. In no-window mode there is no window to hide;
     # calling `wm withdraw .` on this Tk build maps-then-unmaps the toplevel (a
@@ -883,6 +885,7 @@ proc cancel_pending {} {
     if {$::httpToken ne ""}   { catch {http::reset $::httpToken}; set ::httpToken "" }
 }
 proc finish {code} {
+    logsys notice "exit $code"
     catch {after cancel $::autosend_id}
     catch {tk systray destroy}
     if {$::tmpfile ne "" && $::TEST_FILE eq "" && !$::debug_mode} { catch {file delete $::tmpfile} }
@@ -1227,6 +1230,8 @@ proc transcribe {} {
             file copy -force -- $::tmpfile [file join $::LOG_DIR "$::log_stem.wav"]
         }
     }
+    set ::transcribe_ms [clock milliseconds]
+    logsys notice "transcribing ~[expr {int([file size $::tmpfile] / 32000.0)}]s of audio via [expr {[transcribe_use_server] ? "server" : "whisper-cli"}]"
     if {[transcribe_use_server]} { transcribe_server } else { transcribe_local }
 }
 proc transcribe_use_server {} { expr {$::WHISPER_SERVER ne ""} }
@@ -1352,6 +1357,7 @@ proc server_transcribe_failed {reason} {
 # audio format, wrong model), so say so rather than deliver nothing unexplained.
 proc transcribe_succeeded {text} {
     stop_animate
+    logsys notice "transcript: [string length [string trim $text]] chars in [expr {([clock milliseconds] - $::transcribe_ms) / 1000}]s"
     if {[string trim $text] eq ""} {
         logsys warning "transcription is empty (silence, wrong audio format, or wrong model?)"
     }
@@ -1360,8 +1366,15 @@ proc transcribe_succeeded {text} {
 }
 proc poll_recorder {} {
     if {$::recorder_pid == 0} return
-    if {[catch {exec kill -0 $::recorder_pid}]} { set ::recorder_pid 0; transcribe } \
-    else { set ::poll_id [after 200 poll_recorder] }
+    if {[catch {exec kill -0 $::recorder_pid}]} {
+        set ::recorder_pid 0
+        # Ended without stop_recording (recorder crash, audio-stack death):
+        # close the same doors a stop does — listener, auto-stop timer, state —
+        # so a later press starts fresh instead of reaching a corpse's
+        # listener, then transcribe what was captured.
+        if {$::state eq "recording"} { stop_recording recorder-death }
+        transcribe
+    } else { set ::poll_id [after 200 poll_recorder] }
 }
 # Linux: pw-record, else sox. macOS: sox.
 proc resolve_recorder {} {
@@ -1407,8 +1420,9 @@ proc start_recording {} {
     if {[catch {set ::recorder_pid [exec {*}$pcmd &]} err]} {
         ui_error "failed to start [lindex $pcmd 0]: $err"; return
     }
+    logsys notice "recording started: [lindex $pcmd 0] pid $::recorder_pid → $::tmpfile (auto-stop ${::TIMEOUT_S}s)"
     set ::poll_id [after 200 poll_recorder]
-    set ::auto_stop_id [after [expr {$::TIMEOUT_S * 1000}] stop_recording]
+    set ::auto_stop_id [after [expr {$::TIMEOUT_S * 1000}] [list stop_recording auto-stop]]
 }
 
 #==============================================================================
@@ -1435,6 +1449,7 @@ proc probe_running {cmd} {
         logsys warning "running scribe on port $::PORT did not answer '$cmd' within [expr {$::SOCKET_TIMEOUT_MS / 1000}]s — instance wedged? find it with: pgrep -af scribe.tcl"
         exit 1
     }
+    logsys notice "press forwarded to running instance: '$cmd' → [expr {$::probe_reply ne "" ? $::probe_reply : $::probe_done}]"
     if {[string match "OK*" $::probe_reply]} { exit 0 }
     exit 1
 }
@@ -1479,7 +1494,7 @@ proc client_read {sock timer} {
 }
 proc client_dispatch {sock cmd} {
     switch -- $cmd {
-        stop  { puts $sock "OK"; after idle stop_recording }
+        stop  { puts $sock "OK"; after idle [list stop_recording second-press] }
         pause {
             if {$::state eq "paused"} { puts $sock "ACK already-paused" } \
             elseif {$::recorder_pid > 0 && ![catch {exec kill -STOP $::recorder_pid}]} {
@@ -1496,9 +1511,10 @@ proc client_dispatch {sock cmd} {
         default { puts $sock "ACK unknown-command" }
     }
 }
-proc stop_recording {} {
+proc stop_recording {{reason request}} {
     stop_listener
     if {$::auto_stop_id ne ""} { after cancel $::auto_stop_id; set ::auto_stop_id "" }
+    logsys notice "recording stopped ($reason) after [expr {$::start_ms > 0 ? ([clock milliseconds] - $::start_ms) / 1000 : 0}]s"
     if {$::recorder_pid > 0} {
         if {$::state eq "paused"} { catch {exec kill -CONT $::recorder_pid} }
         catch {exec kill $::recorder_pid}
@@ -1760,6 +1776,6 @@ probe_running $::CMD
 serve_listener
 start_recording
 draw_icon 1.0 recording 1
-tk systray create -image $::icon_image -text $::APPNAME -button1 stop_recording
+tk systray create -image $::icon_image -text $::APPNAME -button1 {stop_recording tray-click}
 enter_state recording
 vwait forever

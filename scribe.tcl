@@ -433,12 +433,12 @@ proc on_style_change {} {
     refresh_rewrite_controls
 }
 
-# What a Rewrite click runs is picked by two independent, persisted choices:
-#   style  — a styles/NAME.txt guide, or "none": the clean-up pass alone
-#            (repetitions merged, self-corrections resolved, points reordered)
-#   passes — with a style picked, 2 = clean-up call, then the style call on the
-#            repaired text; 1 = one merged call doing both, on thinking_model
-#            when configured. Moot under "none": always the one clean-up call.
+# What a Rewrite click runs is picked by two independent, persisted choices.
+#   style:  a styles/NAME.txt guide, or "none" for the clean-up pass alone
+#           (repetitions merged, self-corrections resolved, points reordered)
+#   passes: with a style picked, 2 = clean-up call, then the style call on the
+#           repaired text; 1 = one merged call doing both, on thinking_model
+#           when configured. Moot under "none": always the one clean-up call.
 
 # The window's persisted passes pick (sibling of the style pick), default 2.
 proc loadPasses {} {
@@ -1507,7 +1507,7 @@ proc poll_recorder {} {
     if {[catch {exec kill -0 $::recorder_pid}]} {
         set ::recorder_pid 0
         # Ended without stop_recording (recorder crash, audio-stack death):
-        # close the same doors a stop does — listener, auto-stop timer, state —
+        # close the same doors a stop does (listener, auto-stop timer, state)
         # so a later press starts fresh instead of reaching a corpse's
         # listener, then transcribe what was captured.
         if {$::state eq "recording"} { stop_recording recorder-death }
@@ -1570,7 +1570,7 @@ proc start_recording {} {
 # The exchange runs non-blocking against a deadline: a healthy peer answers in
 # milliseconds, and a wedged one must not hang the press invisibly (a hung probe
 # is a keystroke that silently did nothing). On timeout, exit nonzero without
-# recording — the peer still holds the port, so a second recorder could not
+# recording: the peer still holds the port, so a second recorder could not
 # bind; the log line is what tells the user which pid to kill.
 proc probe_running {cmd} {
     if {[catch {socket 127.0.0.1 $::PORT} sock]} { return }
@@ -1608,8 +1608,8 @@ proc serve_listener {} {
 }
 proc stop_listener {} { if {[info exists ::listener]} { catch {close $::listener}; unset ::listener } }
 # The command is read via fileevent with a per-connection deadline, never a
-# blocking gets: one client that connects and goes silent would otherwise stall
-# the whole event loop — icon animation, the --timeout auto-stop, and recorder
+# blocking gets. One client that connects and goes silent would otherwise stall
+# the whole event loop: icon animation, the --timeout auto-stop, and recorder
 # polling all dead while the mic keeps recording.
 proc handle_client {sock _addr _port} {
     fconfigure $sock -buffering line -translation lf -blocking 0

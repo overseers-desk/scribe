@@ -43,7 +43,8 @@ Runtime commands (must be on `PATH`):
 
 | Command | Provides | Needed for |
 |---------|----------|------------|
-| `whisper-cli` | speech-to-text (whisper.cpp) | `--input voice` |
+| `whisper-cli` | speech-to-text (whisper.cpp) | `--input voice`, local transcription |
+| `curl` | POST audio to a whisper.cpp server | `--input voice` with a `[whisper]` server |
 | `pw-record` | audio capture (PipeWire; preferred on Linux) | `--input voice` |
 | `sox` | audio capture (macOS via coreaudio; Linux fallback when pw-record is absent) | `--input voice` |
 | `dotool` | keystroke injection via uinput (Linux) | `--deliver type`, and the paste keystroke |
@@ -163,12 +164,30 @@ window opens with the cursor already in the pane, ready to type.
 
 ## Configuration files
 
-- `config.ini` (`~/.config/scribe/`): AI providers for the style pass. Optional;
-  `[provider.NAME]` sections plus `default_provider`. See `config.example.ini`.
+- `config.ini` (`~/.config/scribe/`): AI providers for the style pass, and an
+  optional `[whisper]` transcription backend. Optional; `[provider.NAME]` sections
+  plus `default_provider`, and `[whisper]` `server_url`/`fallback_local`. See
+  `config.example.ini`.
 - `styles/*.txt`: style guides, one per file; the name is the `--style` value.
 - `current-mode.conf`: the last-used style name, used when `--style` has no name.
 - `system-prompts.yaml`: the wrapper text around the style guide and user text.
 - `dialect-us-to-british.tsv`: US to British spelling pairs.
+
+## Transcription backends
+
+By default scribe transcribes locally with `whisper-cli`. To offload transcription
+to a whisper.cpp `whisper-server` (on this or another machine), add a `[whisper]`
+section to `config.ini`, or pass `--whisper-server URL`:
+
+```ini
+[whisper]
+server_url = http://localhost:8080   # use the server
+fallback_local = true                # if it is down, use whisper-cli
+```
+
+You run the server yourself (scribe only reaches the URL); server mode needs
+`curl`. With `fallback_local`, keep a valid `--model` so the local path can take
+over. Omit `[whisper]` to transcribe locally as before.
 
 ## Self-test
 

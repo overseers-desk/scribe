@@ -83,3 +83,32 @@ style pass scribe drops the model from VRAM through Ollama's native `/api/genera
 itself goes through the OpenAI-compatible endpoint, which ignores `keep_alive`,
 hence the separate native call. It is for a single GPU that cannot hold both the
 chat model and the whisper model, and costs a cold reload on the next style pass.
+
+## Transcription backend
+
+Speech-to-text runs one of three ways, chosen by a `[whisper]` section in
+`config.ini` (independent of `[provider.*]`: transcription, not styling):
+
+- no `[whisper]` / no `server_url` → **local**: `whisper-cli` on the recording
+  (the default; the no-config invariant means this needs nothing configured).
+- `server_url` set → **server**: POST the WAV to a whisper.cpp `whisper-server`.
+- `+ fallback_local = true` → **server, then local** if the server fails.
+
+CLI overrides win over config (like `--provider`): `--whisper-server URL`,
+`--whisper-fallback` / `--no-whisper-fallback`. The `[whisper]` section is read in
+`loadConfig` right after `parse_ini`, before the provider-selection returns, so it
+applies even with no AI provider.
+
+`transcribe` dispatches to `transcribe_server` (POST via `curl`, async, reusing the
+local path's non-blocking-pipe + flip-to-blocking-`close` machinery) or
+`transcribe_local` (the `whisper-cli` path). The model-exists check lives in
+`transcribe_local`, so server-only mode needs no local model; fallback still does.
+Both backends end at `transcribe_succeeded` → `on_source_ready`. A server failure
+(unreachable, non-200, or an unreadable response) either logs a `notice` and runs
+the local backend (fallback on) or reaches `ui_error` (server only); an empty but
+valid transcript is not a failure. scribe never starts or supervises the server.
+
+A remote server takes transcription off the local GPU entirely (the other answer
+to the VRAM contention `unload_after_style` addresses); a persistent *local*
+server instead holds ~2 GB resident and competes with the chat model, so there it
+pairs with `unload_after_style` rather than replacing it.

@@ -74,6 +74,11 @@ set ::NO_GPU           0
 set ::FLASH_ATTN       0
 set ::NO_FLASH_ATTN    0
 set ::PRINT_SPECIAL    0
+# Transcription backend: local whisper-cli (default) or a whisper.cpp server.
+set ::WHISPER_SERVER   ""          ;# base URL; empty = local whisper-cli
+set ::WHISPER_FALLBACK ""          ;# "" until resolved; 1 = run whisper-cli if the server fails
+set ::WHISPER_TIMEOUT_S 120        ;# whole server request cap (seconds)
+set ::WHISPER_CONNECT_TIMEOUT_S 5  ;# fail fast when the server is unreachable
 set ::KEY_DELAY        2
 set ::WORD_DELAY       100
 set ::CMD              stop
@@ -171,6 +176,9 @@ for {set i 0} {$i < [llength $::argv]} {incr i} {
         -fa  - --flash-attn    { set ::FLASH_ATTN 1 }
         -nfa - --no-flash-attn { set ::NO_FLASH_ATTN 1 }
         -ps  - --print-special { set ::PRINT_SPECIAL 1 }
+        --whisper-server      { set ::WHISPER_SERVER [lindex $::argv [incr i]] }
+        --whisper-fallback    { set ::WHISPER_FALLBACK 1 }
+        --no-whisper-fallback { set ::WHISPER_FALLBACK 0 }
         --debug      { set ::debug_mode 1 }
         --self-test  { set ::SELF_TEST 1 }
         --test-text  { set ::TEST_TEXT [lindex $::argv [incr i]] }
@@ -191,8 +199,10 @@ for {set i 0} {$i < [llength $::argv]} {incr i} {
             puts "  --quotes double|single|straight   double: “ ” · single: ‘ ’ · straight: ASCII"
             puts "  --dialect off|british          british: US→UK spelling; default quotes -> single"
             puts "  voice: -m -l -t -to -c --prompt|--prompt-file --key-delay --word-delay -nf -ng -fa -ps"
+            puts "  --whisper-server URL           transcribe via a whisper.cpp server (else local whisper-cli)"
+            puts "  --whisper-fallback             if the server fails, fall back to local whisper-cli"
             puts "  --cmd stop|status|pause|resume  --self-test --test-text S --test-file WAV"
-            puts "  --debug                        keep the recording; write a replay .sh of the whisper-cli call"
+            puts "  --debug                        keep the recording; write a replay .sh of the transcription call"
             exit 0
         }
         default { fatal "unknown argument: $arg" }
@@ -228,6 +238,13 @@ proc transcribe_error_msg {tail} {
         return "Couldn't transcribe: the GPU ran out of memory.\n\nFree some VRAM (another model may be loaded), or start scribe with --no-gpu to transcribe on the CPU."
     }
     return "Couldn't transcribe the recording. The details were written to the log."
+}
+# The server counterpart: a remote failure has no GPU-OOM special case (the server
+# owns its GPU), so point at the server and the log. Worded for any server failure
+# (unreachable, error status, or bad body); the specific reason goes to the log via
+# ui_error's detail, so this message does not use it.
+proc transcribe_server_error_msg {_reason} {
+    return "Couldn't get a transcription from the server at $::WHISPER_SERVER.\n\nIs whisper-server running and reachable there? The details were written to the log."
 }
 
 #==============================================================================
@@ -268,6 +285,21 @@ proc config_candidates {} {
     return [list [file join $xdg scribe config.ini] [file join $::APP_DIR config.ini]]
 }
 
+# Apply the [whisper] section (the transcription backend), independent of any AI
+# provider. Called from loadConfig before its provider-selection returns, so it
+# takes effect even when no provider is configured. Globals already set on the CLI
+# win over config (left untouched here), matching --provider over default_provider.
+proc applyWhisperConfig {ini} {
+    if {![dict exists $ini whisper]} return
+    set w [dict get $ini whisper]
+    if {$::WHISPER_SERVER eq "" && [dict exists $w server_url]} {
+        set ::WHISPER_SERVER [dict get $w server_url]
+    }
+    if {$::WHISPER_FALLBACK eq "" && [dict exists $w fallback_local]} {
+        set ::WHISPER_FALLBACK [expr {[string is true -strict [dict get $w fallback_local]]}]
+    }
+}
+
 # Resolve an AI provider from config.ini, if one is configured. This NEVER
 # fatals: scribe must run as a dictation tool with no config and no keys (see
 # CLAUDE.md). On success sets ::AI_AVAILABLE 1 and ::apiKey/::apiBase/::apiModel;
@@ -283,6 +315,7 @@ proc loadConfig {} {
         logsys warning "cannot read config $path: $err — running without AI"; return
     }
     set ini [parse_ini $data]
+    applyWhisperConfig $ini
     set providers [dict create]
     dict for {sec kv} $ini {
         if {[regexp {^provider\.(.+)$} $sec -> pname]} { dict set providers [string trim $pname] $kv }
@@ -1155,12 +1188,14 @@ proc shell_quote {words} {
 # --debug capture. scribe runs whisper-cli with stderr discarded; this writes a
 # runnable copy of the exact call (stderr intact) beside the kept recording, so
 # the transcription can be replayed by hand to see timings or a GPU crash.
-proc save_debug_command {wcmd} {
-    set cmdfile [file rootname $::tmpfile].sh
+proc save_debug_command {wcmd {kind whisper-cli}} {
+    # kind picks the replay file's name so a fallback run keeps both the server
+    # (curl) and the local (whisper-cli) replays side by side.
+    set cmdfile [file rootname $::tmpfile][expr {$kind eq "curl" ? ".curl.sh" : ".sh"}]
     if {[catch {
         set fh [open $cmdfile w]
         puts $fh "#!/bin/sh"
-        puts $fh "# scribe --debug replay of the whisper-cli call on [file tail $::tmpfile]."
+        puts $fh "# scribe --debug replay of the $kind call on [file tail $::tmpfile]."
         puts $fh "# scribe itself runs this with 2>/dev/null; kept here so you see timings/errors."
         puts $fh [shell_quote $wcmd]
         close $fh
@@ -1170,12 +1205,22 @@ proc save_debug_command {wcmd} {
     dbg "audio kept:    $::tmpfile"
 }
 
+# Transcribe the recording. With a whisper server configured, POST to it; else run
+# whisper-cli locally. The ::done guard and cache dir stay here so a server->local
+# fallback (which re-enters transcribe_local) does not re-trip them.
 proc transcribe {} {
     if {$::done} return
     set ::done 1
     # The --test-file path reaches here without start_recording, so ensure the
-    # cache dir (home of the whisper stderr file below) exists on both paths.
+    # cache dir (home of the stderr file below) exists on both paths.
     file mkdir $::CACHE_DIR
+    if {[transcribe_use_server]} { transcribe_server } else { transcribe_local }
+}
+proc transcribe_use_server {} { expr {$::WHISPER_SERVER ne ""} }
+
+# Local backend: run whisper-cli on the recording. The model-exists check lives
+# here, so server-only mode needs no local model; server-with-fallback still does.
+proc transcribe_local {} {
     # Fail loudly on a missing model rather than let whisper-cli emit nothing and
     # deliver blank. --model is often given relative; report the cwd it resolved
     # against so a wrong relative path is obvious.
@@ -1217,15 +1262,73 @@ proc transcribe_collect {} {
         return
     }
     if {!$::debug_mode} { catch {file delete $::werrfile} }
-    stop_animate
-    # An empty transcript after a clean exit is not an error, but it is the other
-    # way a blank result happens (silence, wrong audio format, wrong model), so
-    # say so rather than deliver nothing without explanation.
-    if {[string trim $::wbuf] eq ""} {
-        logsys warning "whisper returned an empty transcript (silence, wrong audio format, or wrong model?)"
+    transcribe_succeeded $::wbuf
+}
+
+# Server backend: POST the WAV to a whisper.cpp server. curl frames the multipart
+# body and streams the bytes; scribe reuses the local path's non-blocking pipe and
+# flip-to-blocking-close-for-exit-status machinery rather than build multipart in
+# Tcl. whisper-cli-only knobs (-m, -ng, -fa, --prompt) do not apply: the server's
+# model and flags are fixed when the user starts it.
+proc build_server_curl_cmd {} {
+    return [list curl -sS --fail-with-body \
+        --connect-timeout $::WHISPER_CONNECT_TIMEOUT_S --max-time $::WHISPER_TIMEOUT_S \
+        -X POST -F file=@$::tmpfile -F response_format=json -F language=$::LANG \
+        "[string trimright $::WHISPER_SERVER /]/inference"]
+}
+proc transcribe_server {} {
+    set curl [build_server_curl_cmd]
+    if {$::debug_mode} { save_debug_command $curl curl }
+    set ::werrfile [file join $::CACHE_DIR "scribe-[pid].curl.stderr"]
+    if {[catch {set ::wchan [open "|$curl 2>$::werrfile" r]} err]} {
+        server_transcribe_failed "curl failed to start: $err"; return
     }
-    catch {save_log $::wbuf}
-    on_source_ready $::wbuf
+    set ::wbuf ""
+    fconfigure $::wchan -blocking 0
+    fileevent $::wchan readable transcribe_server_collect
+}
+proc transcribe_server_collect {} {
+    append ::wbuf [read $::wchan]
+    if {![eof $::wchan]} return
+    fileevent $::wchan readable {}
+    fconfigure $::wchan -blocking 1
+    if {[catch {close $::wchan} cerr]} {
+        # curl exit 7 = connection refused, 28 = timeout, 22 = HTTP >= 400.
+        set tail [whisper_stderr]
+        server_transcribe_failed "curl: $cerr[expr {$tail ne "" ? " ($tail)" : ""}]"
+        return
+    }
+    if {[catch {
+        package require json
+        set text [dict get [json::json2dict $::wbuf] text]
+    } perr]} {
+        server_transcribe_failed "unreadable server response: $perr"; return
+    }
+    if {!$::debug_mode} { catch {file delete $::werrfile} }
+    transcribe_succeeded $text
+}
+# A server request that never produced a usable transcript. With fallback on, log
+# it and run the local backend; otherwise surface it. An empty-but-valid transcript
+# is NOT a failure (handled in transcribe_succeeded), so silence does not fall back.
+proc server_transcribe_failed {reason} {
+    if {!$::debug_mode} { catch {file delete $::werrfile} }
+    if {$::WHISPER_FALLBACK} {
+        logsys notice "whisper-server ($::WHISPER_SERVER) failed ($reason); falling back to local whisper-cli"
+        transcribe_local
+    } else {
+        ui_error [transcribe_server_error_msg $reason] "whisper-server failed: $reason"
+    }
+}
+# Shared success tail for both backends: an empty transcript after a clean run is
+# not an error, but it is the other way a blank result happens (silence, wrong
+# audio format, wrong model), so say so rather than deliver nothing unexplained.
+proc transcribe_succeeded {text} {
+    stop_animate
+    if {[string trim $text] eq ""} {
+        logsys warning "transcription is empty (silence, wrong audio format, or wrong model?)"
+    }
+    catch {save_log $text}
+    on_source_ready $text
 }
 proc poll_recorder {} {
     if {$::recorder_pid == 0} return
@@ -1405,6 +1508,24 @@ proc run_self_test {} {
     check "ini single-quote val"  {[dict get $_ini "provider.x" model] eq "m"}
     check "ini boolean opt-in"    {[string is true -strict [dict get $_ini "provider.x" unload_after_style]]}
 
+    # --- transcription backend (whisper server) ---
+    set _w [parse_ini "\[whisper\]\nserver_url = http://localhost:8080\nfallback_local = true\n"]
+    check "ini whisper server_url" {[dict get $_w whisper server_url] eq "http://localhost:8080"}
+    set _sv $::WHISPER_SERVER; set _fb $::WHISPER_FALLBACK
+    set ::WHISPER_SERVER ""; set ::WHISPER_FALLBACK ""
+    applyWhisperConfig $_w
+    check "applyWhisperConfig server"   {$::WHISPER_SERVER eq "http://localhost:8080"}
+    check "applyWhisperConfig fallback" {$::WHISPER_FALLBACK == 1}
+    check "transcribe_use_server on"    {[transcribe_use_server]}
+    set ::WHISPER_SERVER ""
+    check "transcribe_use_server off"   {![transcribe_use_server]}
+    set ::WHISPER_SERVER "http://localhost:8080/"; set _tf $::tmpfile; set ::tmpfile "/tmp/x.wav"
+    set _curl [build_server_curl_cmd]
+    check "curl posts the wav"    {[lsearch -exact $_curl "file=@/tmp/x.wav"] >= 0}
+    check "curl asks json"        {[lsearch -exact $_curl "response_format=json"] >= 0}
+    check "curl hits /inference"  {[lindex $_curl end] eq "http://localhost:8080/inference"}
+    set ::tmpfile $_tf; set ::WHISPER_SERVER $_sv; set ::WHISPER_FALLBACK $_fb
+
     set ::sourceText "src"; set ::rewriteText "rw"; setActiveArea 1
     check "active=source pane1" {[active_text] eq "src"}
     setActiveArea 2
@@ -1521,6 +1642,7 @@ if {$::QUOTES ne ""} {
 }
 
 loadConfig
+if {$::WHISPER_FALLBACK eq ""} { set ::WHISPER_FALLBACK 0 }  ;# tri-state -> boolean once config+CLI are in
 loadDialect
 # The style pass is strictly additive (see CLAUDE.md): with no AI provider
 # configured, scribe degrades to a dictation tool rather than failing.

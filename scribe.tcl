@@ -1388,14 +1388,24 @@ proc run_self_test {} {
     set ::WINDOW 1; set ::SELF_TEST 1; set ::QSTYLE double
     if {$::AI_AVAILABLE} {
         loadSystemPrompts; loadStyle
-        set ::sourceText "so the meeting moves to friday because the client called"
-        set ::rewriteState idle; set ::testDone 0
-        run_rewrite
-        set aid [after 65000 {set ::testDone timeout}]
-        vwait ::testDone
-        after cancel $aid
-        check "style pass returned" {$::rewriteState eq "done" && [string length $::rewriteText] > 0} "(state=$::rewriteState)"
-        puts "    STYLED: $::rewriteText"
+        # Dictation-shaped source: a self-correction, a repetition, and a
+        # prerequisite recalled late, so the preprocess call has work to do.
+        set ::sourceText "so the meeting moves to thursday, no wait, friday, the meeting moves to friday because the client called, oh and before that someone has to book the room"
+        foreach {_mode _label} {style "style-only" 2pass "2-pass" 1pass "1-pass"} {
+            set ::PIPELINE_MODE $_mode
+            set ::rewriteState idle; set ::testDone 0
+            run_rewrite
+            set aid [after 65000 {set ::testDone timeout}]
+            vwait ::testDone
+            after cancel $aid
+            check "$_label pipeline returned" {$::rewriteState eq "done" && [string length $::rewriteText] > 0} "(state=$::rewriteState)"
+            if {$_mode eq "2pass"} {
+                check "2-pass preprocess call completed" {[string length $::preprocessText] > 0}
+                puts "    PREPROCESSED: $::preprocessText"
+            }
+            puts "    STYLED ($_label): $::rewriteText"
+        }
+        set ::PIPELINE_MODE 2pass
     } else {
         puts "SKIP: style pass (no AI provider configured)"
     }
@@ -1416,7 +1426,7 @@ proc run_self_test {} {
         set ok [expr {[winfo exists .pane1.txt] && [winfo exists .btns.go]}]
         if {$::AI_AVAILABLE} {
             check "review UI builds (style controls present without --style)" \
-                {$ok && [winfo exists .pane2.txt] && [winfo exists .btns.style] && [winfo exists .pane2.hdr.style] && ![winfo exists .tip]}
+                {$ok && [winfo exists .pane2.txt] && [winfo exists .btns.style] && [winfo exists .pane2.hdr.style] && [winfo exists .pane2.hdr.pipe] && ![winfo exists .tip]}
         } else {
             check "review UI builds (single pane; Style button invites config)" {$ok && ![winfo exists .pane2.txt] && [winfo exists .btns.style] && ![winfo exists .tip]}
         }
@@ -1443,6 +1453,20 @@ proc run_self_test {} {
         {[string length $::styleGuide] > 0 && $::STYLE_NAME eq $_other && $_persisted eq $_other}
     catch {file delete $::STATE_STYLE_FILE}
     set ::STATE_STYLE_FILE $_saveState
+
+    # Pipeline pick: round-trips through its state file and defaults to 2pass
+    # when none exists. Scratch file, so the real pick is untouched.
+    set _saveP $::STATE_PIPELINE_FILE
+    set _scratchP [file join "/tmp" "scribe-selftest-[pid].pipeline"]
+    set ::STATE_PIPELINE_FILE $_scratchP
+    savePipelineChoice 1pass
+    loadPipelineMode
+    check "pipeline pick persists and reloads" {$::PIPELINE_MODE eq "1pass"}
+    set ::STATE_PIPELINE_FILE [file join "/tmp" "scribe-selftest-[pid].absent"]
+    loadPipelineMode
+    check "pipeline pick defaults to 2pass" {$::PIPELINE_MODE eq "2pass"}
+    catch {file delete $_scratchP}
+    set ::STATE_PIPELINE_FILE $_saveP
 
     puts [expr {$fail ? "SELF-TEST: FAIL" : "SELF-TEST: PASS"}]
     exit $fail

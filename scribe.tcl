@@ -117,6 +117,7 @@ set ::log_stem      ""
 set ::auto_stop_id  ""
 set ::poll_id       ""
 set ::wdog_id       ""          ;# local-transcription watchdog timer
+set ::wchan         ""          ;# transcription pipe (whisper-cli or curl)
 set ::transcribe_ms 0           ;# when the transcription attempt began
 set ::capture_sink  launch      ;# launch: transcript builds/fills the window; window: it lands in the open pane
 set ::win_pulse_id  ""          ;# in-window recording indicator pulse timer
@@ -894,7 +895,7 @@ proc finish {code} {
     # The window can close mid-capture (Listen running): take the recorder and
     # any in-flight whisper-cli with it, or the mic stays hot in an orphan.
     if {$::recorder_pid > 0} { catch {exec kill $::recorder_pid} }
-    catch { if {[info exists ::wchan]} { foreach p [pid $::wchan] { exec kill $p } } }
+    catch { if {$::wchan ne ""} { foreach p [pid $::wchan] { exec kill $p } } }
     catch {tk systray destroy}
     if {$::tmpfile ne "" && $::TEST_FILE eq "" && !$::debug_mode} { catch {file delete $::tmpfile} }
     after 0 [list exit $code]
@@ -1402,11 +1403,21 @@ proc transcribe_local {} {
 proc transcribe_local_timeout {} {
     set ::wdog_id ""
     logsys err "whisper-cli still running after its ${::WHISPER_TIMEOUT_S}s-plus-audio budget; killing it"
-    # The kill surfaces as EOF plus a nonzero close in transcribe_collect,
-    # which reports through the normal failure path (dialog + log).
-    catch { foreach p [pid $::wchan] { exec kill $p } }
+    set chan $::wchan
+    set ::wchan ""
+    # Nothing here waits on the child: a GPU-wedged process can sit in
+    # uninterruptible sleep where even kill -9 lands late, so waiting for its
+    # EOF would hang exactly when the watchdog is needed. Unhook the reader,
+    # kill, and let the nonblocking close detach rather than wait.
+    catch { fileevent $chan readable {} }
+    catch { foreach p [pid $chan] { exec kill -9 $p } }
+    catch { close $chan }
+    set tail [whisper_stderr]
+    if {!$::debug_mode} { catch {file delete $::werrfile} }
+    ui_error [transcribe_error_msg $tail] "whisper-cli killed after its time budget[expr {$tail ne "" ? ": $tail" : ""}]"
 }
 proc transcribe_collect {} {
+    if {$::wchan eq ""} return
     append ::wbuf [read $::wchan]
     if {![eof $::wchan]} return
     if {$::wdog_id ne ""} { after cancel $::wdog_id; set ::wdog_id "" }

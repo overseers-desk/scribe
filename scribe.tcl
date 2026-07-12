@@ -64,7 +64,7 @@ set ::QSTYLE           double      ;# resolved: double | single | straight
 set ::DIALECT          off         ;# off | british
 
 # --- whisper / recording ---
-set ::MODEL            "$::env(HOME)/code/whisper.cpp/models/ggml-medium.en.bin"
+set ::MODEL            ""          ;# whisper model path; set by --model or [whisper] model (no built-in default)
 set ::LANG             en
 set ::TIMEOUT_S        300
 set ::THREADS          4
@@ -298,6 +298,9 @@ proc config_candidates {} {
 proc applyWhisperConfig {ini} {
     if {![dict exists $ini whisper]} return
     set w [dict get $ini whisper]
+    if {$::MODEL eq "" && [dict exists $w model]} {
+        set ::MODEL [dict get $w model]
+    }
     if {$::WHISPER_SERVER eq "" && [dict exists $w server_url]} {
         set ::WHISPER_SERVER [dict get $w server_url]
     }
@@ -1370,8 +1373,12 @@ proc transcribe_local {} {
     # Fail loudly on a missing model rather than let whisper-cli emit nothing and
     # deliver blank. --model is often given relative; report the cwd it resolved
     # against so a wrong relative path is obvious.
+    if {$::MODEL eq ""} {
+        ui_error "no whisper model configured: set model in the \[whisper\] section of config.ini, or pass --model"
+        return
+    }
     if {![file exists $::MODEL]} {
-        ui_error "whisper model not found: $::MODEL (resolved from cwd [pwd]); pass an absolute --model"
+        ui_error "whisper model not found: $::MODEL (resolved from cwd [pwd]); pass an absolute --model or set \[whisper\] model"
         return
     }
     set wcmd [list whisper-cli -m $::MODEL -f $::tmpfile -nt -l $::LANG -t $::THREADS]
@@ -1730,11 +1737,12 @@ proc run_self_test {} {
     check "ini boolean opt-in"    {[string is true -strict [dict get $_ini "provider.x" unload_after_style]]}
 
     # --- transcription backend (whisper server) ---
-    set _w [parse_ini "\[whisper\]\nserver_url = http://localhost:8080\nfallback_local = true\n"]
+    set _w [parse_ini "\[whisper\]\nmodel = /m/ggml.bin\nserver_url = http://localhost:8080\nfallback_local = true\n"]
     check "ini whisper server_url" {[dict get $_w whisper server_url] eq "http://localhost:8080"}
-    set _sv $::WHISPER_SERVER; set _fb $::WHISPER_FALLBACK
-    set ::WHISPER_SERVER ""; set ::WHISPER_FALLBACK ""
+    set _sv $::WHISPER_SERVER; set _fb $::WHISPER_FALLBACK; set _md $::MODEL
+    set ::WHISPER_SERVER ""; set ::WHISPER_FALLBACK ""; set ::MODEL ""
     applyWhisperConfig $_w
+    check "applyWhisperConfig model"    {$::MODEL eq "/m/ggml.bin"}
     check "applyWhisperConfig server"   {$::WHISPER_SERVER eq "http://localhost:8080"}
     check "applyWhisperConfig fallback" {$::WHISPER_FALLBACK == 1}
     check "transcribe_use_server on"    {[transcribe_use_server]}
@@ -1745,7 +1753,7 @@ proc run_self_test {} {
     check "curl posts the wav"    {[lsearch -exact $_curl "file=@/tmp/x.wav"] >= 0}
     check "curl asks json"        {[lsearch -exact $_curl "response_format=json"] >= 0}
     check "curl hits /inference"  {[lindex $_curl end] eq "http://localhost:8080/inference"}
-    set ::tmpfile $_tf; set ::WHISPER_SERVER $_sv; set ::WHISPER_FALLBACK $_fb
+    set ::tmpfile $_tf; set ::WHISPER_SERVER $_sv; set ::WHISPER_FALLBACK $_fb; set ::MODEL $_md
 
     set ::sourceText "src"; set ::rewriteText "rw"; setActiveArea 1
     check "active=source pane1" {[active_text] eq "src"}

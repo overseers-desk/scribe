@@ -34,7 +34,8 @@ On macOS the formula pulls `sox` for audio capture; keystrokes and clipboard go
 through the system's own `osascript` and `pbcopy`. On Linux the formula installs
 scribe and Tcl/Tk only. For `--input voice`, install whisper.cpp separately
 (`brew install whisper-cpp` provides `whisper-cli`) and supply a whisper model
-file such as `ggml-medium.en.bin`. On Linux, a recorder (`pw-record`, or `sox`
+file such as `ggml-medium.en.bin`, named in the `[whisper]` section of
+`config.ini` or passed with `--model`. On Linux, a recorder (`pw-record`, or `sox`
 as fallback) and `dotool` must also be on `PATH` (see Dependencies below).
 
 ## Dependencies
@@ -61,8 +62,9 @@ Other requirements:
   `http`, `tls`, `json`, and `yaml` must be available to that interpreter. On
   Ubuntu those were provided by tcllib. With OS X brew they came with tcl9.
 
-- A **whisper model** file (for example `ggml-medium.en.bin`), passed with
-  `--model`, for `--input voice`.
+- A **whisper model** file (for example `ggml-medium.en.bin`) for `--input
+  voice`, named in the `[whisper]` section of `config.ini` (`model = ...`) or
+  passed with `--model`. There is no built-in default path.
 
 - An **AI provider** in `config.ini`, only for `--style` (optional; see below).
 - `dotool` needs access to `/dev/uinput` (typically membership of the `input`
@@ -190,13 +192,15 @@ section to `config.ini`, or pass `--whisper-server URL`:
 
 ```ini
 [whisper]
-server_url = http://localhost:8080   # use the server
-fallback_local = true                # if it is down, use whisper-cli
+model      = /path/to/ggml-medium.en.bin   # local transcription (or pass --model)
+server_url = http://localhost:8080         # or offload to a server
+fallback_local = true                      # if it is down, use whisper-cli
 ```
 
 You run the server yourself (scribe only reaches the URL); server mode needs
-`curl`. With `fallback_local`, keep a valid `--model` so the local path can take
-over. Omit `[whisper]` to transcribe locally as before.
+`curl`. With `fallback_local`, keep `model` set (or pass `--model`) so the local
+path can take over. For purely local transcription, set `model` and leave
+`server_url` out.
 
 To test the loop headlessly (e.g. over SSH, where there is no display), pair
 `--deliver stdout` with a virtual display: `xvfb-run -a scribe.tcl --input voice

@@ -7,8 +7,11 @@ API key of any kind**. This is a hard invariant — do not break it.
 
 - Any input source (typed into the window, dictated via `--input voice` or the
   window's Listen button, or grabbed with `--input clipboard`) → normalisation
-  (quotes, dialect) → delivery (type / paste / clipboard) must always work, on
-  its own, with zero configuration.
+  (quotes, dialect) → delivery (type / paste / clipboard) must always work with
+  no AI provider and no key. Voice transcription additionally needs a whisper
+  model — named in `[whisper] model` or `--model`, with no built-in default —
+  and a whisper backend, the same kind of transcription dependency as
+  `whisper-cli` on `PATH`; locating the model never pulls in a provider or key.
 - The AI **style pass is strictly additive**. It is the only feature that needs a
   provider. When none is configured:
   - never `fatal` / never exit non-zero because config or a key is missing;
@@ -95,8 +98,9 @@ chat model and the whisper model, and costs a cold reload on the next style pass
 Speech-to-text runs one of three ways, chosen by a `[whisper]` section in
 `config.ini` (independent of `[provider.*]`: transcription, not styling):
 
-- no `[whisper]` / no `server_url` → **local**: `whisper-cli` on the recording
-  (the default; the no-config invariant means this needs nothing configured).
+- no `server_url` → **local**: `whisper-cli` on the recording (the default
+  backend). The model comes from `[whisper] model` or `--model`; local
+  transcription with neither reaches `ui_error` (no provider or key needed).
 - `server_url` set → **server**: POST the WAV to a whisper.cpp `whisper-server`.
 - `+ fallback_local = true` → **server, then local** if the server fails.
 
@@ -107,8 +111,9 @@ applies even with no AI provider.
 
 `transcribe` dispatches to `transcribe_server` (POST via `curl`, async, reusing the
 local path's non-blocking-pipe + flip-to-blocking-`close` machinery) or
-`transcribe_local` (the `whisper-cli` path). The model-exists check lives in
-`transcribe_local`, so server-only mode needs no local model; fallback still does.
+`transcribe_local` (the `whisper-cli` path). The model checks (unset, then
+missing file) live in `transcribe_local`, so server-only mode needs no local
+model; fallback still does.
 Both backends end at `transcribe_succeeded` → `on_source_ready`. A server failure
 (unreachable, non-200, or an unreadable response) either logs a `notice` and runs
 the local backend (fallback on) or reaches `ui_error` (server only); an empty but

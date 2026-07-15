@@ -1900,6 +1900,26 @@ if {$::QUOTES ne ""} {
     set ::QSTYLE [expr {$::DIALECT eq "british" ? "single" : "double"}]
 }
 
+# Voice launch claims the second-press socket here, before the config and style
+# loads below, so a second press's blind window (when it cannot yet reach this
+# instance) is only the interpreter start, not that plus the loads. The bind is
+# the arbiter: win it and this instance is the recorder; find the port already
+# held and another instance is recording, so forward this press's command
+# ($::CMD, default stop) to it and exit, rather than start a second recorder.
+# Only a voice launch takes this path and claims it here; the self-test,
+# --test-*, clipboard, and keyboard modes divert to their own wait first.
+if {$::INPUT eq "voice" && !$::SELF_TEST && $::TEST_TEXT eq "" && $::TEST_FILE eq ""} {
+    probe_running $::CMD
+    serve_listener
+    if {![info exists ::listener]} {
+        # The probe found no instance, yet the bind failed: a rival claimed the
+        # port in the gap between probe and bind. Forward to it and exit rather
+        # than fall through to recording without owning the port.
+        probe_running $::CMD
+        exit 1
+    }
+}
+
 loadConfig
 if {$::WHISPER_FALLBACK eq ""} { set ::WHISPER_FALLBACK 0 }  ;# tri-state -> boolean once config+CLI are in
 loadDialect
@@ -1928,9 +1948,9 @@ if {$::INPUT eq "clipboard"} { after idle acquire_clipboard; vwait forever }
 # Keyboard (default): open an empty editable window and wait for the user to type.
 if {$::INPUT eq "keyboard"} { after idle [list on_source_ready ""]; vwait forever }
 
-# Voice. A second press reaches the running recorder over the socket.
-probe_running $::CMD
-serve_listener
+# Voice. The second-press socket was claimed above, before the config load;
+# reaching here means this instance won the bind and is the recorder. A second
+# press reaches this recorder over that socket.
 start_recording
 draw_icon 1.0 recording 1
 tk systray create -image $::icon_image -text $::APPNAME -button1 {stop_recording tray-click}

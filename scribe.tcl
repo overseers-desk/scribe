@@ -230,25 +230,45 @@ proc logsys {level msg} {
 # The window is the root `.` with no wm geometry and no configured font, so its
 # size comes from Tk's scaling factor and the default-font metrics alone. On this
 # HiDPI panel some launches come up normal and some quarter-size; these fields say
-# which, and separate the two candidate causes. Logged at three moments
-# (`startup`, `review-build`, `review-mapped`): the first two run while the
-# surface is still withdrawn, the last after deiconify once it has entered an
-# output. If tkscaling/req/linespace differ between a normal and a tiny run, Tk
-# read a different DPI; if they match yet the window still renders tiny, the
-# compositor scaled the surface. server/wl/x report the backend so a run is
-# confirmed Wayland-native. It is an unconditional notice, not gated behind
-# --debug, so an ordinary launch captures it in journalctl -t scribe without
-# changing the command or retaining recordings. It changes no behaviour and is
-# wrapped in catch so a failed winfo call cannot break the recording path.
+# which. Two quantities carry the answer: `act`, the window's realized pixel size,
+# and `cap`, how many characters the source pane actually holds, taken from its
+# real pixel size over the font's own char metrics rather than the -width 80
+# request. If act/cap/tkscaling move between a normal and a tiny run, the flip is
+# one Tk can see (a different logical size or DPI); if they hold steady while the
+# glyphs still shrink, the compositor scaled the surface below anything winfo
+# reports. Sampled at four moments: `startup` and `review-build` while the surface
+# is withdrawn, `review-mapped` right after deiconify, and `review-settled` a beat
+# later once the compositor's configure has had time to land. server/wl/x report
+# the backend. It is an unconditional notice, not gated behind --debug, so an
+# ordinary launch captures it in journalctl -t scribe without changing the command
+# or retaining recordings. It changes no behaviour and is wrapped in catch so a
+# failed winfo call cannot break the recording path.
 proc log_scaling {when} {
     catch {
         update idletasks
+        # Realized capacity of the source pane: the fill-expanded widget's actual
+        # pixel size over its font's char cell, so it grows when more (smaller)
+        # glyphs fit the same box. Absent until the pane exists and is mapped.
+        set pane "pane=- cap=-"
+        if {[winfo exists .pane1.txt] && [winfo ismapped .pane1.txt]} {
+            set f [.pane1.txt cget -font]
+            if {$f eq ""} { set f TkFixedFont }
+            set cw [font measure $f "0"]
+            set lh [font metrics $f -linespace]
+            set pw [winfo width .pane1.txt]
+            set ph [winfo height .pane1.txt]
+            set cols [expr {$cw > 0 ? $pw / $cw : 0}]
+            set rows [expr {$lh > 0 ? $ph / $lh : 0}]
+            set pane [format "pane=%dx%d cap=%dx%d" $pw $ph $cols $rows]
+        }
         logsys notice [format \
-            "scaling@%s tkscaling=%.3f pct=%s screen=%dx%dpx mm=%dx%dmm req=%dx%d linespace=%s fontsize=%s server={%s} wl=%s x=%s" \
+            "scaling@%s tkscaling=%.3f pct=%s screen=%dx%dpx mm=%dx%dmm req=%dx%d act=%dx%d %s linespace=%s fontsize=%s server={%s} wl=%s x=%s" \
             $when [tk scaling] [::tk::ScalingPct] \
             [winfo screenwidth .] [winfo screenheight .] \
             [winfo screenmmwidth .] [winfo screenmmheight .] \
             [winfo reqwidth .] [winfo reqheight .] \
+            [winfo width .] [winfo height .] \
+            $pane \
             [font metrics TkDefaultFont -linespace] [font actual TkDefaultFont -size] \
             [winfo server .] \
             [expr {[info exists ::env(WAYLAND_DISPLAY)] ? $::env(WAYLAND_DISPLAY) : "-"}] \
@@ -1213,6 +1233,9 @@ proc on_source_ready {text} {
         build_review_ui
         wm deiconify .; raise .
         log_scaling review-mapped
+        # A second read once the compositor's post-map configure/scale has landed,
+        # which the immediate sample above can miss on Wayland.
+        after 800 [list log_scaling review-settled]
         # Empty source (keyboard mode): put the cursor in the pane so the user can
         # type. Pre-filled (voice/clipboard): keep focus on the toplevel so Space
         # delivers, and re-assert it against the WM's post-map focus.

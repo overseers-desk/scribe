@@ -117,7 +117,7 @@ Stacked vertical layout with three frames:
 
 2. **DeepSeek API Key:**
    * Stored in `deepseek.json` file.
-   * This file should be copied from `/home/weiwu/code/Google-Spaces-Tasks-reporter.web/config/bots/raven/deepseek.json`.
+   * The operator supplies this file from an existing DeepSeek API credential.
    * Format:
      ```json
      {

@@ -805,10 +805,14 @@ proc clip_backend {} {
     }
     return $::clipBackend
 }
+# Every backend takes the text on stdin: Tcl's exec reads redirection operators
+# out of its argument words before the program runs, so text of ">>" or "> foo"
+# passed as an argument is a Tcl redirect, not text. Transcripts do reach that
+# shape — a near-silent recording transcribes as the two characters ">>".
 proc set_clipboard {txt} {
     switch -- [clip_backend] {
         macos   { exec pbcopy << $txt }
-        wayland { exec wl-copy -- $txt }
+        wayland { exec wl-copy << $txt }
         x11     {
             # xclip daemonises to hold the X11 selection; redirect its
             # stdout/stderr off Tcl's pipe or exec blocks waiting for the
@@ -1862,14 +1866,20 @@ proc run_self_test {} {
     set ::SOCKET_TIMEOUT_MS $_saveT
 
     set ::DELIVER clipboard
-    if {![catch {set_clipboard "round-trip-probe"}]} {
+    # A near-silent recording transcribes as ">>", which reaches the clipboard as
+    # a whole transcript (see set_clipboard for why that shape once broke it).
+    foreach _probe {round-trip-probe >>} {
+        if {[catch {set_clipboard $_probe}]} {
+            check "clipboard write of \"$_probe\"" 0
+            continue
+        }
         set back ""
         switch -- [clip_backend] {
             macos   { catch {set back [exec pbpaste]} }
             wayland { catch {set back [exec wl-paste -n]} }
             x11     { catch {set back [exec xclip -selection clipboard -o]} }
         }
-        check "clipboard round-trip" {$back eq "round-trip-probe"}
+        check "clipboard round-trip of \"$_probe\"" {$back eq $_probe}
     }
 
     set ::STYLE_ON 0; set ::INPUT voice; set ::STYLE_NAME "clear"; set ::DELIVER paste

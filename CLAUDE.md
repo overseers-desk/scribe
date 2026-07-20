@@ -1,9 +1,11 @@
 # Scribe — working notes for Claude
 
-## Invariant: scribe runs with no configuration and no AI keys
+The invariants live in [`INVARIANTS.md`](INVARIANTS.md): the no-config promise and the config resolution order. A change that breaks one is a design change, the owner's to make.
 
-Scribe must work as a plain dictation tool when there is **no `config.ini` and no
-API key of any kind**. This is a hard invariant — do not break it.
+## The no-config contract
+
+Scribe works as a plain dictation tool when there is **no `config.ini` and no
+API key of any kind** (the first invariant). What that means concretely:
 
 - Any input source (typed into the window, dictated via `--input voice` or the
   window's Listen button, or grabbed with `--input clipboard`) → normalisation

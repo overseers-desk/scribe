@@ -2,6 +2,8 @@
 
 The invariants live in [`INVARIANTS.md`](INVARIANTS.md): the no-config promise and the config resolution order. A change that breaks one is a design change, the owner's to make.
 
+@INVARIANTS.md
+
 ## The no-config contract
 
 Scribe works as a plain dictation tool when there is **no `config.ini` and no

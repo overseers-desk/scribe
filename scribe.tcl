@@ -42,6 +42,7 @@ set ::SYSTEM_PROMPTS   [file join $::APP_DIR "system-prompts.yaml"]
 set ::CONFIG_FILE      [file join $::APP_DIR "current-mode.conf"]
 set ::STATE_STYLE_FILE [file join [expr {[info exists ::env(XDG_STATE_HOME)] && $::env(XDG_STATE_HOME) ne "" ? $::env(XDG_STATE_HOME) : "$::env(HOME)/.local/state"}] scribe style]
 set ::STATE_PIPELINE_FILE [file join [file dirname $::STATE_STYLE_FILE] pipeline]
+set ::STATE_HISTORY_FILE  [file join [file dirname $::STATE_STYLE_FILE] history.tsv]
 set ::DIALECT_FILE     [file join $::APP_DIR "dialect-us-to-british.tsv"]
 set ::LOG_DIR          /var/local/log/dictation
 set ::CACHE_DIR        [file join [expr {[info exists ::env(XDG_CACHE_HOME)] && $::env(XDG_CACHE_HOME) ne "" ? $::env(XDG_CACHE_HOME) : "$::env(HOME)/.cache"}] scribe]
@@ -138,6 +139,11 @@ set ::preprocessText ""         ;# 2-pass: output of the preprocess call
 set ::pipelineModel  ""         ;# model the current pipeline runs (1-pass may pick thinking_model)
 set ::activeArea     1
 set ::rewriteState   idle
+
+# --- history ---
+set ::HISTORY_MAX      999      ;# entries kept; the oldest unmarked one goes first
+set ::history          {}       ;# newest first; each entry {date mark original revised}
+set ::history_selected -1       ;# index of the entry recalled into the panes, -1 for none
 
 #==============================================================================
 # ARGUMENT PARSING
@@ -517,6 +523,162 @@ proc savePasses {v} {
 proc on_passes_change {} {
     savePasses $::PASSES
     refresh_rewrite_controls
+}
+
+#==============================================================================
+# HISTORY
+#==============================================================================
+
+# Every delivered text lands in history.tsv, beside the style and passes state
+# files. Shift+Escape lands one there without delivering it, marked, so text can
+# be set aside instead of thrown away. An entry is the list {date mark original
+# revised} and the history is a list of those, newest first: a record type would
+# buy nothing over four fields the same code reads and writes.
+#
+# One record per physical line, so the file reads with a plain split. Every line
+# ending inside a field collapses to a single carriage return going in, whatever
+# the copy source used, and expands back to a newline coming out. csv::join does
+# the rest of the escaping: a field carrying a tab or a quote comes back quoted,
+# so a clipboard grab of spreadsheet cells survives the trip. Both channels run
+# -translation lf, or Tcl's default rewrites those carriage returns to newlines
+# on the way back and every stored line break splits its record.
+proc history_encode {s} { string map [list \r\n \r \n \r] $s }
+proc history_decode {s} { string map [list \r \n] $s }
+
+proc history_load {} {
+    package require csv
+    set ::history {}
+    if {![file exists $::STATE_HISTORY_FILE]} return
+    if {[catch {
+        set f [open $::STATE_HISTORY_FILE r]
+        fconfigure $f -translation lf -encoding utf-8
+        set data [read $f]; close $f
+        foreach line [split $data \n] {
+            if {[string trim $line] eq ""} continue
+            if {[catch {csv::split $line \t} cols]} continue
+            if {[llength $cols] < 4} continue
+            lassign $cols date mark orig rev
+            lappend ::history [list $date [string is true -strict $mark] \
+                                    [history_decode $orig] [history_decode $rev]]
+        }
+    } err]} { logsys warning "cannot read history: $err" }
+}
+
+proc history_save {} {
+    package require csv
+    history_trim
+    if {[catch {
+        file mkdir [file dirname $::STATE_HISTORY_FILE]
+        set f [open $::STATE_HISTORY_FILE w 0o600]   ;# clipboard grabs land here
+        fconfigure $f -translation lf -encoding utf-8
+        foreach e $::history {
+            lassign $e date mark orig rev
+            puts $f [csv::join [list $date [expr {$mark ? "true" : "false"}] \
+                                [history_encode $orig] [history_encode $rev]] \t]
+        }
+        close $f
+    } err]} { logsys warning "cannot write history: $err" }
+}
+
+# Full at ::HISTORY_MAX, the oldest unmarked entry goes first: text set aside
+# outlives the ordinary deliveries piling up in front of it. With every entry
+# marked there is nothing else to drop, so the oldest goes.
+proc history_trim {} {
+    while {[llength $::history] > $::HISTORY_MAX} {
+        set victim -1
+        for {set i [expr {[llength $::history] - 1}]} {$i >= 0} {incr i -1} {
+            if {![lindex $::history $i 1]} { set victim $i; break }
+        }
+        if {$victim < 0} { set victim [expr {[llength $::history] - 1}] }
+        set ::history [lreplace $::history $victim $victim]
+    }
+}
+
+# A delivery, or a Shift+Escape, commits the pair the window is holding. Text
+# recalled from the list updates that entry in place and takes the mark it is
+# given, rather than adding a second copy of a note already in the list.
+proc history_commit {mark} {
+    lassign [history_pair] orig rev
+    if {$orig eq "" && $rev eq ""} return
+    if {$::history_selected >= 0 && $::history_selected < [llength $::history]} {
+        set date [lindex $::history $::history_selected 0]
+        set ::history [lreplace $::history $::history_selected $::history_selected \
+                            [list $date $mark $orig $rev]]
+    } else {
+        set date [clock format [clock seconds] -format {%Y-%m-%dT%H:%M:%S}]
+        set ::history [linsert $::history 0 [list $date $mark $orig $rev]]
+    }
+    history_save
+}
+
+# The pair as the window holds it now. Panes are editable, so the widget wins
+# where it exists (as active_text does). ::rewriteText gates the result pane
+# because paneRewriteStatus parks placeholders and progress messages there, and
+# a placeholder stored as a rewrite would come back as one.
+proc history_pair {} {
+    set orig $::sourceText
+    if {[winfo exists .pane1.txt]} { set orig [string trim [.pane1.txt get 1.0 end]] }
+    set rev ""
+    if {$::rewriteText ne ""} {
+        set rev $::rewriteText
+        if {[winfo exists .pane2.txt]} { set rev [string trim [.pane2.txt get 1.0 end]] }
+    }
+    return [list $orig $rev]
+}
+
+# The row reads as what the text became where it was rewritten, else as what was
+# dictated. Trimmed by measurement rather than a character count: a count
+# depends on the theme font, and where it guesses long the treeview clips the
+# row silently and takes the ellipsis off the end with it.
+proc history_label {entry width} {
+    lassign $entry date mark orig rev
+    set s [string trim [expr {$rev ne "" ? $rev : $orig}]]
+    regsub -all {\s+} $s " " s
+    set font [ttk::style lookup Treeview -font]
+    if {$font eq ""} { set font TkDefaultFont }
+    while {$s ne "" && [font measure $font "$s…"] > $width} {
+        set cut [string last " " $s]
+        if {$cut < 0} { set s [string range $s 0 end-1] } else { set s [string range $s 0 $cut-1] }
+    }
+    return "$s…"
+}
+
+# Stored to the second so entries sort and stay distinct; shown to the minute,
+# which is what fits the column.
+proc history_display_date {stamp} { string map {T " "} [string range $stamp 0 15] }
+
+proc history_populate {} {
+    if {![winfo exists .hist.tv]} return
+    .hist.tv delete [.hist.tv children {}]
+    set width [.hist.tv column text -width]
+    set i 0
+    foreach e $::history {
+        .hist.tv insert {} end -id h$i -values [list [expr {[lindex $e 1] ? "*" : ""}] \
+            [history_display_date [lindex $e 0]] [history_label $e $width]]
+        incr i
+    }
+}
+
+# Selecting an entry brings the pair back into the panes it came from. With no
+# provider there is no result pane, so the entry arrives as whatever it became.
+proc on_history_select {} {
+    set sel [lindex [.hist.tv selection] 0]
+    if {$sel eq ""} return
+    set i [string range $sel 1 end]
+    if {![string is integer -strict $i] || $i >= [llength $::history]} return
+    set ::history_selected $i
+    lassign [lindex $::history $i] date mark orig rev
+    if {[winfo exists .pane2.txt]} {
+        set ::sourceText $orig
+        set ::rewriteText $rev
+        set ::rewriteState [expr {$rev ne "" ? "done" : "idle"}]
+        if {$rev ne ""} { paneSetRewrite $rev } else { paneRewriteStatus [result_placeholder] }
+        setActiveArea [expr {$rev ne "" ? 2 : 1}]
+    } else {
+        set ::sourceText [expr {$rev ne "" ? $rev : $orig}]
+        setActiveArea 1
+    }
+    .pane1.txt delete 1.0 end; .pane1.txt insert 1.0 $::sourceText
 }
 
 #==============================================================================
@@ -906,6 +1068,9 @@ proc poll_inject {} {
 proc deliver_now {text {withEnter 0}} {
     cancel_pending
     logsys notice "delivering [string length $text] chars via $::DELIVER"
+    # Every delivery is history, unmarked: it has been used. All four modes come
+    # through here, so this is the one place that needs to say so.
+    history_commit 0
     # In window mode, hide the review window first so focus returns to the prior
     # window before we type/paste. In no-window mode there is no window to hide;
     # calling `wm withdraw .` on this Tk build maps-then-unmaps the toplevel (a
@@ -1061,6 +1226,23 @@ proc build_review_ui {} {
     # configured; with none, scribe shows a single dictation pane (see CLAUDE.md).
     set styleable $::AI_AVAILABLE
 
+    # History down the left, in both layouts: it needs no provider. Packed first
+    # and -side left so the stack below keeps its own paths and fills the cavity
+    # that remains. The mark takes a column of its own rather than a prefix on
+    # the text: "* " and two spaces differ by 3px in the theme font, which would
+    # leave every unmarked row's text a step out of line.
+    pack [ttk::frame .hist -padding {6 6 0 6}] -side left -fill y
+    ttk::treeview .hist.tv -columns {mark date text} -show "" -selectmode browse \
+        -yscrollcommand {.hist.sb set} -takefocus 0
+    .hist.tv column mark -width 16  -minwidth 16  -stretch 0 -anchor center
+    .hist.tv column date -width 118 -minwidth 118 -stretch 0
+    .hist.tv column text -width 190 -minwidth 60  -stretch 1
+    ttk::scrollbar .hist.sb -orient vertical -command {.hist.tv yview}
+    pack .hist.sb -side right -fill y
+    pack .hist.tv -side left -fill both -expand 1
+    bind .hist.tv <<TreeviewSelect>> on_history_select
+    history_populate
+
     pack [ttk::frame .pane1 -padding 6] -fill both -expand 1
     pack [ttk::frame .pane1.hdr] -fill x
     pack [ttk::label .pane1.hdr.lbl -text $srcLabel] -side left
@@ -1116,8 +1298,10 @@ proc build_review_ui {} {
         ttk::button .btns.rewrite -text "Rewrite" -command rewrite_or_prompt -takefocus 0
         pack .btns.rewrite -side left -padx 4
     }
-    ttk::button .btns.copy -text "Copy to clipboard" -command {set_clipboard [active_text]; finish 0} -takefocus 0
+    ttk::button .btns.copy -text "Copy to clipboard" -command {history_commit 0; set_clipboard [active_text]; finish 0} -takefocus 0
     pack .btns.copy -side left -padx 4
+    pack [ttk::label .btns.keys -foreground #98989d \
+              -text "Esc discard · Shift+Esc keep in history"] -side right -padx 4
 
     .pane1.txt insert 1.0 $::sourceText
     if {$styleable} { refresh_rewrite_controls }
@@ -1130,11 +1314,14 @@ proc build_review_ui {} {
     bind . <Return>         {if {![typing_focus]} {deliver_now [active_text] 1; break}}
     bind . <Control-Return> {deliver_now [active_text] 0; break}
     bind . <Escape>         {if {$::state eq "recording"} {stop_recording escape} else {finish 0}; break}
+    # Escape drops the text; Shift+Escape keeps it, marked, without delivering.
+    # Mid-recording both stop the recording, so a mis-hit cannot take one down.
+    bind . <Shift-Escape>   {if {$::state eq "recording"} {stop_recording escape} else {history_commit 1; finish 0}; break}
     if {$styleable} {
         bind . <Up>   {if {![typing_focus]} {setActiveArea 1; break}}
         bind . <Down> {if {![typing_focus]} {setActiveArea 2; break}}
     }
-    wm protocol . WM_DELETE_WINDOW {set_clipboard [active_text]; finish 0}
+    wm protocol . WM_DELETE_WINDOW {history_commit 0; set_clipboard [active_text]; finish 0}
     refresh_highlight
     log_scaling review-build
 }
@@ -1888,6 +2075,8 @@ proc run_self_test {} {
         if {$::AI_AVAILABLE} {
             check "review UI builds (rewrite controls present without --style)" \
                 {$ok && [winfo exists .pane2.txt] && [winfo exists .ctrl.stylerow.none] && [winfo exists .ctrl.passrow.p1] && [winfo exists .ctrl.passrow.rewrite] && [winfo exists .pane1.hdr.listen] && ![winfo exists .btns.rewrite] && ![winfo exists .tip]}
+            check "history pane present alongside the rewrite controls" \
+                {[winfo exists .hist.tv] && [.hist.tv cget -columns] eq {mark date text}}
             # Under "No style" the passes row greys (moot choice), never hides.
             set ::STYLE_NAME none; set ::styleGuide ""; refresh_rewrite_controls
             check "passes row greys under No style" {[.ctrl.passrow.p1 instate disabled]}
@@ -1895,6 +2084,9 @@ proc run_self_test {} {
             check "passes row re-enables with a style" {[.ctrl.passrow.p1 instate !disabled]}
         } else {
             check "review UI builds (single pane; Rewrite button invites config)" {$ok && ![winfo exists .pane2.txt] && ![winfo exists .ctrl] && [winfo exists .btns.rewrite] && [winfo exists .pane1.hdr.listen] && ![winfo exists .tip]}
+            # History needs no provider, so the pane is there in both layouts.
+            check "history pane present without a provider" \
+                {[winfo exists .hist.tv] && [.hist.tv cget -columns] eq {mark date text}}
         }
     } else { check "review UI builds" 0 "($e)" }
 
@@ -1939,6 +2131,69 @@ proc run_self_test {} {
     check "passes default to 2" {$::PASSES == 2}
     catch {file delete $_scratchP}
     set ::STATE_PIPELINE_FILE $_saveP
+
+    # --- history ---
+    # Round-trip against a scratch file, so the real history is untouched.
+    set _saveH $::STATE_HISTORY_FILE
+    set _saveHist $::history
+    set _saveMax $::HISTORY_MAX
+    set ::STATE_HISTORY_FILE [file join "/tmp" "scribe-selftest-[pid].history.tsv"]
+
+    set _awkward "one\r\ntwo\nthree\tfour \"quoted\""
+    check "line endings encode to a lone CR" \
+        {![string match "*\n*" [history_encode $_awkward]] && [string match "*\r*" [history_encode $_awkward]]}
+    check "decode restores every line break" \
+        {[history_decode [history_encode $_awkward]] eq "one\ntwo\nthree\tfour \"quoted\""}
+
+    package require csv
+    set _rec [csv::join [list "2026-01-02T03:04:05" true [history_encode $_awkward] ""] \t]
+    check "an encoded record is one physical line" {[llength [split $_rec \n]] == 1}
+    set _cols [csv::split $_rec \t]
+    check "a tab inside the text stays inside its field" \
+        {[llength $_cols] == 4 && [history_decode [lindex $_cols 2]] eq [history_decode [history_encode $_awkward]]}
+
+    set ::history [list [list "2026-01-02T03:04:05" 1 $_awkward "rewritten"]]
+    history_save
+    history_load
+    check "mark stores as true/false and reads back" \
+        {[llength $::history] == 1 && [lindex $::history 0 1] == 1}
+    check "the pair survives the file" \
+        {[lindex $::history 0 2] eq [history_decode [history_encode $_awkward]] && [lindex $::history 0 3] eq "rewritten"}
+    check "history file is owner-only" \
+        {[format %o [expr {[file attributes $::STATE_HISTORY_FILE -permissions] & 0o777}]] eq "600"}
+    catch {file delete $::STATE_HISTORY_FILE}
+
+    # Overflow drops the oldest unmarked entry, and only reaches a marked one
+    # when every entry is marked.
+    set ::HISTORY_MAX 3
+    set ::history {}
+    foreach {_n _m} {d4 0 d3 1 d2 0 d1 0} { lappend ::history [list "2026-01-0$_n" $_m $_n ""] }
+    history_trim
+    check "overflow evicts the oldest unmarked entry" \
+        {[llength $::history] == 3 && [lsearch -index 2 $::history d1] < 0 && [lsearch -index 2 $::history d3] >= 0}
+    set ::history {}
+    foreach _n {m3 m2 m1} { lappend ::history [list "2026-01-0$_n" 1 $_n ""] }
+    lappend ::history [list "2026-01-old" 1 m0 ""]
+    history_trim
+    check "with every entry marked the oldest still goes" \
+        {[llength $::history] == 3 && [lsearch -index 2 $::history m0] < 0}
+    set ::HISTORY_MAX $_saveMax
+
+    # The row text prefers the rewrite, ends in an ellipsis, and is trimmed to
+    # fit rather than left for the treeview to clip.
+    set _long [list "2026-01-02T03:04:05" 0 "the raw dictation that was spoken" \
+                    "a rewritten sentence considerably longer than the column it has to sit in"]
+    set _row [history_label $_long 190]
+    check "row text ends in an ellipsis" {[string match "*…" $_row]}
+    check "row text fits the column" {[font measure TkDefaultFont $_row] <= 190}
+    check "row text prefers the rewrite" {[string match "a rewritten*" $_row]}
+    check "row text falls back to the original" \
+        {[string match "the raw*" [history_label [lreplace $_long 3 3 ""] 190]]}
+    check "date shows to the minute" \
+        {[history_display_date "2026-01-02T03:04:05"] eq "2026-01-02 03:04"}
+
+    set ::history $_saveHist
+    set ::STATE_HISTORY_FILE $_saveH
 
     puts [expr {$fail ? "SELF-TEST: FAIL" : "SELF-TEST: PASS"}]
     exit $fail
@@ -1989,6 +2244,7 @@ if {$::INPUT eq "voice" && !$::SELF_TEST && $::TEST_TEXT eq "" && $::TEST_FILE e
 loadConfig
 if {$::WHISPER_FALLBACK eq ""} { set ::WHISPER_FALLBACK 0 }  ;# tri-state -> boolean once config+CLI are in
 loadDialect
+history_load   ;# no provider needed, so it loads outside the AI_AVAILABLE gate below
 # The style pass is strictly additive (see CLAUDE.md): with no AI provider
 # configured, scribe degrades to a dictation tool rather than failing.
 if {$::STYLE_ON && !$::AI_AVAILABLE} {

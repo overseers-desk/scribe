@@ -59,8 +59,9 @@ Settings → Privacy & Security.
 Other requirements:
 
 - **Tcl/Tk 9** with a working `wish9.0` and `tk systray`. The Tcl packages
-  `http`, `tls`, `json`, and `yaml` must be available to that interpreter. On
-  Ubuntu those were provided by tcllib. With OS X brew they came with tcl9.
+  `http`, `tls`, `json`, `yaml`, and `csv` must be available to that
+  interpreter. On Ubuntu those were provided by tcllib. With OS X brew they
+  came with tcl9.
 
 - A **whisper model** file (for example `ggml-medium.en.bin`) for `--input
   voice`, named in the `[whisper]` section of `config.ini` (`model = ...`) or
@@ -128,9 +129,9 @@ there is nothing to type into without a window.
 ## Review window
 
 When a window is shown it has two panes, the dictated text and the result,
-with one highlighted. The rewrite controls and the result pane appear only
-when a provider is configured. Both panes are editable: click into one to
-correct the text before rewriting or delivering.
+with one highlighted, and the history list down the left. The rewrite controls
+and the result pane appear only when a provider is configured. Both panes are
+editable: click into one to correct the text before rewriting or delivering.
 
 A **Listen** button in the pane header records from the window itself: press,
 dictate, and press again (or Escape) to stop. The transcript lands in the
@@ -160,9 +161,26 @@ The keys depend on focus. With the window itself focused (as it opens after voic
 or clipboard input), Space delivers, Enter delivers and then sends a return, and
 Up/Down switch the highlighted pane. Once you click into a pane to edit, Space and
 Enter type normally; deliver with Ctrl+Enter or the button. Escape closes without
-pasting; closing the window (or the Copy button) copies to the clipboard first.
-In keyboard mode the window opens with the cursor already in the pane, ready to
-type.
+pasting and throws the text away; Shift+Escape closes without pasting and keeps
+the text in history. Closing the window (or the Copy button) copies to the
+clipboard first. In keyboard mode the window opens with the cursor already in the
+pane, ready to type.
+
+### History
+
+Every text scribe delivers is kept. **Shift+Escape** keeps one without
+delivering it: the window closes, nothing is pasted, and the entry is listed
+with a `*` to say it has not been used yet. The list runs down the left of the
+window, newest first, showing the time and the opening words of each entry.
+Selecting one brings it back into the panes, both the dictation and its rewrite,
+ready to edit or deliver. Deliver it and the `*` goes.
+
+Entries live in `history.tsv` under `~/.local/state/scribe/`, four
+tab-separated columns: date, mark, original, rewrite. Line breaks inside an
+entry are stored as carriage returns, so one entry is always one line and the
+file reads in anything that reads TSV. The newest 999 entries are kept; when it
+fills, the oldest entry without a `*` goes first, so text set aside outlasts the
+ordinary deliveries piling up in front of it.
 
 ## Text normalisation
 

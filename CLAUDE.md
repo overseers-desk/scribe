@@ -61,6 +61,42 @@ the self-test and windowless delivery: a stage that signals mid-chain releases
 the test's `vwait` and fires delivery after only half the pipeline has run.
 Under `none` the clean-up call is itself the terminal stage.
 
+## History
+
+Every delivery, and every Shift+Escape, commits the pair `{original, revised}` to
+`history.tsv` beside the `style` and `pipeline` state files. `deliver_now` is the
+one funnel for all four delivery modes, so it carries the `history_commit` call;
+the two paths reaching the clipboard without it (the Copy button,
+`WM_DELETE_WINDOW`) carry their own. Shift+Escape commits with the mark set and
+delivers nothing; mid-recording it stops the recording as Escape does, so a
+mis-hit cannot take a recording down.
+
+`history_load` runs outside the `::AI_AVAILABLE` gate and the treeview is built
+in both layouts: history needs no provider (first invariant), and the self-test
+asserts the pane in both required passes.
+
+An entry is the list `{date mark original revised}`; the history is a list of
+those, newest first. `::history_selected` holds the index recalled into the
+panes, and committing while it is set updates that entry in place instead of
+adding a second copy of a note the delivery has just used. Full at
+`::HISTORY_MAX`, `history_trim` drops the oldest unmarked entry and reaches a
+marked one only once every entry is marked.
+
+One record per physical line. `history_encode` collapses every line ending
+inside a field to a lone CR and `history_decode` expands it back, so the file
+reads with `split $data \n`; `csv::join` / `csv::split` (tcllib) take care of
+tabs and quotes, which clipboard grabs of spreadsheet cells do carry. Both
+channels set `-translation lf`: Tcl's default read translation rewrites a lone
+CR to LF, which would turn every stored line break into a record boundary. The
+mark stores as `true`/`false` and reads back through `string is true -strict`,
+as `unload_after_style` does.
+
+The treeview row text is trimmed by `font measure`, not by a character count:
+the count depends on the theme font, and a row the treeview clips loses its
+trailing ellipsis. The mark takes its own 16px column because `"* "` and two
+spaces differ by 3px in that font, which would step every unmarked row out of
+line.
+
 ## AI provider config
 
 Providers live in `config.ini`, resolved in this order:

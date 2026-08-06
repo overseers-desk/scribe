@@ -2178,6 +2178,24 @@ proc run_self_test {} {
         {[llength $::history] == 3 && [lsearch -index 2 $::history m0] < 0}
     set ::HISTORY_MAX $_saveMax
 
+    # Committing a recalled entry updates it where it sits and takes the mark
+    # off, rather than leaving a second copy of the note behind it.
+    set ::history [list [list "2026-01-02T03:04:05" 1 "set aside earlier" ""] \
+                        [list "2026-01-01T01:01:01" 0 "older" ""]]
+    set ::history_selected 0
+    .pane1.txt delete 1.0 end; .pane1.txt insert 1.0 "edited after recall"
+    set ::rewriteText ""
+    history_commit 0
+    check "delivering a recalled entry drops its mark, adding no copy" \
+        {[llength $::history] == 2 && [lindex $::history 0 1] == 0 && [lindex $::history 0 2] eq "edited after recall"}
+    check "a recalled entry keeps its date and its place" \
+        {[lindex $::history 0 0] eq "2026-01-02T03:04:05" && [lindex $::history 1 2] eq "older"}
+    set ::history_selected -1
+    history_commit 1
+    check "with nothing recalled the entry is new and marked" \
+        {[llength $::history] == 3 && [lindex $::history 0 1] == 1}
+    catch {file delete $::STATE_HISTORY_FILE}
+
     # The row text prefers the rewrite, ends in an ellipsis, and is trimmed to
     # fit rather than left for the treeview to clip.
     set _long [list "2026-01-02T03:04:05" 0 "the raw dictation that was spoken" \

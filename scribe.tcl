@@ -643,8 +643,8 @@ proc history_label {entry width} {
     return "$s…"
 }
 
-# Stored to the second so entries sort and stay distinct; shown to the minute,
-# which is what fits the column.
+# Order is list position, not this field: the stamp keeps its seconds for anyone
+# reading the raw file, and the column has room for the minute.
 proc history_display_date {stamp} { string map {T " "} [string range $stamp 0 15] }
 
 proc history_populate {} {
@@ -659,8 +659,8 @@ proc history_populate {} {
     }
 }
 
-# Selecting an entry brings the pair back into the panes it came from. With no
-# provider there is no result pane, so the entry arrives as whatever it became.
+# With no provider there is no result pane, so the entry arrives as whatever it
+# became.
 proc on_history_select {} {
     set sel [lindex [.hist.tv selection] 0]
     if {$sel eq ""} return
@@ -2084,7 +2084,6 @@ proc run_self_test {} {
             check "passes row re-enables with a style" {[.ctrl.passrow.p1 instate !disabled]}
         } else {
             check "review UI builds (single pane; Rewrite button invites config)" {$ok && ![winfo exists .pane2.txt] && ![winfo exists .ctrl] && [winfo exists .btns.rewrite] && [winfo exists .pane1.hdr.listen] && ![winfo exists .tip]}
-            # History needs no provider, so the pane is there in both layouts.
             check "history pane present without a provider" \
                 {[winfo exists .hist.tv] && [.hist.tv cget -columns] eq {mark date text}}
         }

@@ -71,8 +71,8 @@ the two paths reaching the clipboard without it (the Copy button,
 delivers nothing; mid-recording it stops the recording as Escape does, so a
 mis-hit cannot take a recording down.
 
-`history_load` runs outside the `::AI_AVAILABLE` gate and the treeview is built
-in both layouts: history needs no provider (first invariant), and the self-test
+`history_load` runs outside the `::AI_AVAILABLE` gate and the list is built in
+both layouts: history needs no provider (first invariant), and the self-test
 asserts the pane in both required passes.
 
 An entry is the list `{date mark original revised}`; the history is a list of
@@ -91,11 +91,17 @@ CR to LF, which would turn every stored line break into a record boundary. The
 mark stores as `true`/`false` and reads back through `string is true -strict`,
 as `unload_after_style` does.
 
-The treeview row text is trimmed by `font measure`, not by a character count:
-the count depends on the theme font, and a row the treeview clips loses its
-trailing ellipsis. The mark takes its own 16px column because `"* "` and two
-spaces differ by 3px in that font, which would step every unmarked row out of
-line.
+The list is a `tk::listbox`, one row per entry, `date  message`. A treeview
+would carry aligned columns for free, but the Wayland Tk this runs on draws its
+cells blank; the listbox is a classic Tk widget like the panes, drawing its own
+text rather than through the Ttk treeview cell drawing that comes up blank here.
+The date leads so its left edge anchors the column in any font, and a
+not-yet-used entry's message opens `* `, past the date, where a variable-width
+glyph leaves the date alignment untouched. `history_row` trims the message on a
+word boundary to `::HISTORY_MSG_CHARS`, and the listbox `-width` is derived from
+that same budget so the widest row's ellipsis is not clipped. `-exportselection
+0` keeps a row click from seizing the X PRIMARY selection, which would clobber
+the user's middle-click paste.
 
 ## AI provider config
 

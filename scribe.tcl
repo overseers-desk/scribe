@@ -142,6 +142,7 @@ set ::rewriteState   idle
 
 # --- history ---
 set ::HISTORY_MAX      999      ;# entries kept; the oldest unmarked one goes first
+set ::HISTORY_MSG_CHARS 28      ;# message text trimmed to this before the ellipsis
 set ::history          {}       ;# newest first; each entry {date mark original revised}
 set ::history_selected -1       ;# index of the entry recalled into the panes, -1 for none
 
@@ -626,46 +627,39 @@ proc history_pair {} {
     return [list $orig $rev]
 }
 
-# The row reads as what the text became where it was rewritten, else as what was
-# dictated. Trimmed by measurement rather than a character count: a count
-# depends on the theme font, and where it guesses long the treeview clips the
-# row silently and takes the ellipsis off the end with it.
-proc history_label {entry width} {
+# One row is "date  message". The date leads so its left edge anchors the column
+# in any font. A not-yet-used entry marks its message with a leading "* ", which
+# sits after the fixed-width date where a variable-width glyph disturbs nothing;
+# the date stays aligned. The message is what the text became where it was
+# rewritten, else what was dictated, trimmed on a word boundary to a budget.
+proc history_row {entry} {
     lassign $entry date mark orig rev
     set s [string trim [expr {$rev ne "" ? $rev : $orig}]]
     regsub -all {\s+} $s " " s
-    set font [ttk::style lookup Treeview -font]
-    if {$font eq ""} { set font TkDefaultFont }
-    while {$s ne "" && [font measure $font "$s…"] > $width} {
+    if {[string length $s] > $::HISTORY_MSG_CHARS} {
+        set s [string range $s 0 $::HISTORY_MSG_CHARS-1]
         set cut [string last " " $s]
-        if {$cut < 0} { set s [string range $s 0 end-1] } else { set s [string range $s 0 $cut-1] }
+        if {$cut > 0} { set s [string range $s 0 $cut-1] }
+        set s "$s…"
     }
-    return "$s…"
+    return "[history_display_date $date]  [expr {$mark ? "* " : ""}]$s"
 }
 
 # Order is list position, not this field: the stamp keeps its seconds for anyone
-# reading the raw file, and the column has room for the minute.
+# reading the raw file, and the row has room for the minute.
 proc history_display_date {stamp} { string map {T " "} [string range $stamp 0 15] }
 
 proc history_populate {} {
-    if {![winfo exists .hist.tv]} return
-    .hist.tv delete [.hist.tv children {}]
-    set width [.hist.tv column text -width]
-    set i 0
-    foreach e $::history {
-        .hist.tv insert {} end -id h$i -values [list [expr {[lindex $e 1] ? "*" : ""}] \
-            [history_display_date [lindex $e 0]] [history_label $e $width]]
-        incr i
-    }
+    if {![winfo exists .hist.lb]} return
+    .hist.lb delete 0 end
+    foreach e $::history { .hist.lb insert end [history_row $e] }
 }
 
 # With no provider there is no result pane, so the entry arrives as whatever it
 # became.
 proc on_history_select {} {
-    set sel [lindex [.hist.tv selection] 0]
-    if {$sel eq ""} return
-    set i [string range $sel 1 end]
-    if {![string is integer -strict $i] || $i >= [llength $::history]} return
+    set i [lindex [.hist.lb curselection] 0]
+    if {$i eq "" || $i >= [llength $::history]} return
     set ::history_selected $i
     lassign [lindex $::history $i] date mark orig rev
     if {[winfo exists .pane2.txt]} {
@@ -1228,19 +1222,21 @@ proc build_review_ui {} {
 
     # History down the left, in both layouts: it needs no provider. Packed first
     # and -side left so the stack below keeps its own paths and fills the cavity
-    # that remains. The mark takes a column of its own rather than a prefix on
-    # the text: "* " and two spaces differ by 3px in the theme font, which would
-    # leave every unmarked row's text a step out of line.
+    # that remains. A listbox rather than a treeview: this build's treeview draws
+    # blank cells, and the listbox is a classic Tk widget like the panes; it
+    # draws its own text directly rather than through the Ttk treeview cell
+    # drawing that comes up blank here. -exportselection 0 keeps a row click
+    # from seizing the X PRIMARY selection, which would clobber the user's
+    # middle-click paste. The width fits the widest row (date 16, gap 2, mark 2,
+    # message + ellipsis) so the trimmed ellipsis is never itself clipped.
     pack [ttk::frame .hist -padding {6 6 0 6}] -side left -fill y
-    ttk::treeview .hist.tv -columns {mark date text} -show "" -selectmode browse \
-        -yscrollcommand {.hist.sb set} -takefocus 0
-    .hist.tv column mark -width 16  -minwidth 16  -stretch 0 -anchor center
-    .hist.tv column date -width 118 -minwidth 118 -stretch 0
-    .hist.tv column text -width 190 -minwidth 60  -stretch 1
-    ttk::scrollbar .hist.sb -orient vertical -command {.hist.tv yview}
+    listbox .hist.lb -width [expr {21 + $::HISTORY_MSG_CHARS}] \
+        -selectmode browse -activestyle none \
+        -exportselection 0 -yscrollcommand {.hist.sb set} -takefocus 0
+    ttk::scrollbar .hist.sb -orient vertical -command {.hist.lb yview}
     pack .hist.sb -side right -fill y
-    pack .hist.tv -side left -fill both -expand 1
-    bind .hist.tv <<TreeviewSelect>> on_history_select
+    pack .hist.lb -side left -fill both -expand 1
+    bind .hist.lb <<ListboxSelect>> on_history_select
     history_populate
 
     pack [ttk::frame .pane1 -padding 6] -fill both -expand 1
@@ -2076,7 +2072,7 @@ proc run_self_test {} {
             check "review UI builds (rewrite controls present without --style)" \
                 {$ok && [winfo exists .pane2.txt] && [winfo exists .ctrl.stylerow.none] && [winfo exists .ctrl.passrow.p1] && [winfo exists .ctrl.passrow.rewrite] && [winfo exists .pane1.hdr.listen] && ![winfo exists .btns.rewrite] && ![winfo exists .tip]}
             check "history pane present alongside the rewrite controls" \
-                {[winfo exists .hist.tv] && [.hist.tv cget -columns] eq {mark date text}}
+                {[winfo exists .hist.lb] && [winfo class .hist.lb] eq "Listbox"}
             # Under "No style" the passes row greys (moot choice), never hides.
             set ::STYLE_NAME none; set ::styleGuide ""; refresh_rewrite_controls
             check "passes row greys under No style" {[.ctrl.passrow.p1 instate disabled]}
@@ -2085,7 +2081,7 @@ proc run_self_test {} {
         } else {
             check "review UI builds (single pane; Rewrite button invites config)" {$ok && ![winfo exists .pane2.txt] && ![winfo exists .ctrl] && [winfo exists .btns.rewrite] && [winfo exists .pane1.hdr.listen] && ![winfo exists .tip]}
             check "history pane present without a provider" \
-                {[winfo exists .hist.tv] && [.hist.tv cget -columns] eq {mark date text}}
+                {[winfo exists .hist.lb] && [winfo class .hist.lb] eq "Listbox"}
         }
     } else { check "review UI builds" 0 "($e)" }
 
@@ -2196,16 +2192,24 @@ proc run_self_test {} {
         {[llength $::history] == 3 && [lindex $::history 0 1] == 1}
     catch {file delete $::STATE_HISTORY_FILE}
 
-    # The row text prefers the rewrite, ends in an ellipsis, and is trimmed to
-    # fit rather than left for the treeview to clip.
+    # A row leads with the date, then the message, trimmed on a word boundary to
+    # the budget and closed with an ellipsis. A marked entry's message opens "* ",
+    # past the date, so the date column stays put.
     set _long [list "2026-01-02T03:04:05" 0 "the raw dictation that was spoken" \
-                    "a rewritten sentence considerably longer than the column it has to sit in"]
-    set _row [history_label $_long 190]
-    check "row text ends in an ellipsis" {[string match "*…" $_row]}
-    check "row text fits the column" {[font measure TkDefaultFont $_row] <= 190}
-    check "row text prefers the rewrite" {[string match "a rewritten*" $_row]}
-    check "row text falls back to the original" \
-        {[string match "the raw*" [history_label [lreplace $_long 3 3 ""] 190]]}
+                    "a rewritten sentence considerably longer than the message budget it has to sit in"]
+    set _row [history_row $_long]
+    check "row leads with the date" {[string match "2026-01-02 03:04  *" $_row]}
+    check "row ends in an ellipsis" {[string match "*…" $_row]}
+    check "message trimmed to the budget" \
+        {[string length $_row] <= 18 + $::HISTORY_MSG_CHARS + 1}
+    check "row prefers the rewrite" {[string match "*a rewritten*" $_row]}
+    check "row falls back to the original" \
+        {[string match "*the raw*" [history_row [lreplace $_long 3 3 ""]]]}
+    # The message begins at column 18: 16 for the date, 2 for the gap.
+    check "a marked entry's message opens with the star, past the date" \
+        {[string range [history_row [lreplace $_long 1 1 1]] 0 19] eq "2026-01-02 03:04  * "}
+    check "an unmarked entry's message has no leading star" \
+        {[string range $_row 18 19] ne "* "}
     check "date shows to the minute" \
         {[history_display_date "2026-01-02T03:04:05"] eq "2026-01-02 03:04"}
 

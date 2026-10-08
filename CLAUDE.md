@@ -155,13 +155,16 @@ CLI overrides win over config (like `--provider`): `--whisper-server URL`,
 `loadConfig` right after `parse_ini`, before the provider-selection returns, so it
 applies even with no AI provider.
 
-`transcribe` dispatches to `transcribe_server` (POST via `curl`, async, reusing the
-local path's non-blocking-pipe + flip-to-blocking-`close` machinery) or
-`transcribe_local` (the `whisper-cli` path). The model checks (unset, then
+`transcribe` dispatches to `transcribe_server` (a multipart POST through the
+`http` package, async) or `transcribe_local` (the `whisper-cli` path). The
+server request has a watchdog that judges it by phase: a connect budget until
+the first byte leaves, then the upload's pace projected to the whole body, then
+a response budget once the upload is in, since whisper-server sends nothing
+while it transcribes. The model checks (unset, then
 missing file) live in `transcribe_local`, so server-only mode needs no local
 model; fallback still does.
 Both backends end at `transcribe_succeeded` → `on_source_ready`. A server failure
-(unreachable, non-200, or an unreadable response) either logs a `notice` and runs
+(unreachable, too slow by the watchdog, non-200, or an unreadable response) either logs a `notice` and runs
 the local backend (fallback on) or reaches `ui_error` (server only); an empty but
 valid transcript is not a failure. scribe never starts or supervises the server.
 

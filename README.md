@@ -45,7 +45,6 @@ Runtime commands (must be on `PATH`):
 | Command | Provides | Needed for |
 |---------|----------|------------|
 | `whisper-cli` | speech-to-text (whisper.cpp) | `--input voice`, local transcription |
-| `curl` | POST audio to a whisper.cpp server | `--input voice` with a `[whisper]` server |
 | `pw-record` | audio capture (PipeWire; preferred on Linux) | `--input voice` |
 | `sox` | audio capture (macOS via coreaudio; Linux fallback when pw-record is absent) | `--input voice` |
 | `dotool` | keystroke injection via uinput (Linux) | `--deliver type`, and the paste keystroke |
@@ -215,8 +214,7 @@ server_url = http://localhost:8080         # or offload to a server
 fallback_local = true                      # if it is down, use whisper-cli
 ```
 
-You run the server yourself (scribe only reaches the URL); server mode needs
-`curl`. With `fallback_local`, keep `model` set (or pass `--model`) so the local
+You run the server yourself (scribe only reaches the URL). With `fallback_local`, keep `model` set (or pass `--model`) so the local
 path can take over. For purely local transcription, set `model` and leave
 `server_url` out.
 

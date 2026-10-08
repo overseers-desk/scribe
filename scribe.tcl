@@ -79,8 +79,10 @@ set ::PRINT_SPECIAL    0
 # Transcription backend: local whisper-cli (default) or a whisper.cpp server.
 set ::WHISPER_SERVER   ""          ;# base URL; empty = local whisper-cli
 set ::WHISPER_FALLBACK ""          ;# "" until resolved; 1 = run whisper-cli if the server fails
-set ::WHISPER_TIMEOUT_S 120        ;# whole server request cap (seconds)
+set ::WHISPER_TIMEOUT_S 120        ;# server's response budget once the upload is in (seconds)
 set ::WHISPER_CONNECT_TIMEOUT_S 5  ;# fail fast when the server is unreachable
+set ::WHISPER_UPLOAD_GRACE_S 10    ;# upload pace is judged from this many seconds in
+set ::WHISPER_UPLOAD_MAX_S 100     ;# an upload whose pace projects past this is given up
 set ::KEY_DELAY        2
 set ::WORD_DELAY       100
 set ::CMD              stop
@@ -117,8 +119,13 @@ set ::tmpfile       ""
 set ::log_stem      ""
 set ::auto_stop_id  ""
 set ::poll_id       ""
-set ::wdog_id       ""          ;# local-transcription watchdog timer
-set ::wchan         ""          ;# transcription pipe (whisper-cli or curl)
+set ::wdog_id       ""          ;# transcription watchdog timer
+set ::wchan         ""          ;# whisper-cli pipe
+set ::wtok          ""          ;# whisper-server request token ("pending" while geturl runs)
+set ::wsent         0           ;# request bytes written so far
+set ::wtotal        0           ;# request size in bytes
+set ::wup_ms        0           ;# when the server request began
+set ::wdone_ms      0           ;# when its upload finished; 0 while uploading
 set ::transcribe_ms 0           ;# when the transcription attempt began
 set ::capture_sink  launch      ;# launch: transcript builds/fills the window; window: it lands in the open pane
 set ::win_pulse_id  ""          ;# in-window recording indicator pulse timer
@@ -808,14 +815,20 @@ proc buildJSONPayload {model systemPrompt userText {maxTokens 2000}} {
     return $json
 }
 
-# POST one chat completion; the callback receives the http token. Any launch
-# failure ends the pipeline through api_fail.
-proc api_call {model systemPrompt userText callback {maxTokens 2000}} {
+# The http package with https through tls, for the provider calls and the
+# whisper-server upload.
+proc http_init {} {
     package require http
     package require tls
     if {[catch { ::tls::init -autoservername true; http::register https 443 [list ::tls::socket -autoservername true] }]} {
         http::register https 443 ::tls::socket
     }
+}
+
+# POST one chat completion; the callback receives the http token. Any launch
+# failure ends the pipeline through api_fail.
+proc api_call {model systemPrompt userText callback {maxTokens 2000}} {
+    http_init
     set payload [encoding convertto utf-8 [buildJSONPayload $model $systemPrompt "${::userTextPrefix}${userText}\n" $maxTokens]]
     set headers [list Authorization "Bearer $::apiKey" Content-Type "application/json; charset=utf-8"]
     if {[catch {
@@ -1567,14 +1580,12 @@ proc shell_quote {words} {
 # --debug capture. scribe runs whisper-cli with stderr discarded; this writes a
 # runnable copy of the exact call (stderr intact) beside the kept recording, so
 # the transcription can be replayed by hand to see timings or a GPU crash.
-proc save_debug_command {wcmd {kind whisper-cli}} {
-    # kind picks the replay file's name so a fallback run keeps both the server
-    # (curl) and the local (whisper-cli) replays side by side.
-    set cmdfile [file rootname $::tmpfile][expr {$kind eq "curl" ? ".curl.sh" : ".sh"}]
+proc save_debug_command {wcmd} {
+    set cmdfile [file rootname $::tmpfile].sh
     if {[catch {
         set fh [open $cmdfile w]
         puts $fh "#!/bin/sh"
-        puts $fh "# scribe --debug replay of the $kind call on [file tail $::tmpfile]."
+        puts $fh "# scribe --debug replay of the whisper-cli call on [file tail $::tmpfile]."
         puts $fh "# scribe itself runs this with 2>/dev/null; kept here so you see timings/errors."
         puts $fh [shell_quote $wcmd]
         close $fh
@@ -1685,53 +1696,99 @@ proc transcribe_collect {} {
     transcribe_succeeded $::wbuf
 }
 
-# Server backend: POST the WAV to a whisper.cpp server. curl frames the multipart
-# body and streams the bytes; scribe reuses the local path's non-blocking pipe and
-# flip-to-blocking-close-for-exit-status machinery rather than build multipart in
-# Tcl. whisper-cli-only knobs (-m, -ng, -fa, --prompt) do not apply: the server's
-# model and flags are fixed when the user starts it.
-proc build_server_curl_cmd {} {
-    return [list curl -sS --fail-with-body \
-        --connect-timeout $::WHISPER_CONNECT_TIMEOUT_S --max-time $::WHISPER_TIMEOUT_S \
-        -X POST -F file=@$::tmpfile -F response_format=json -F language=$::LANG \
-        "[string trimright $::WHISPER_SERVER /]/inference"]
+# Server backend: POST the WAV to a whisper.cpp server as multipart/form-data
+# through the http package, asynchronously, with a once-a-second watchdog that
+# judges the request by its phase. whisper-cli-only knobs (-m, -ng, -fa,
+# --prompt) do not apply: the server's model and flags are fixed when the user
+# starts it.
+proc server_inference_url {} { return "[string trimright $::WHISPER_SERVER /]/inference" }
+proc server_request_body {wav boundary} {
+    set body ""
+    foreach {name value} [list response_format json language $::LANG] {
+        append body "--$boundary\r\nContent-Disposition: form-data; name=\"$name\"\r\n\r\n$value\r\n"
+    }
+    append body "--$boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"[file tail $::tmpfile]\"\r\n" \
+        "Content-Type: audio/wav\r\n\r\n" $wav "\r\n--$boundary--\r\n"
+    return $body
 }
 proc transcribe_server {} {
-    set curl [build_server_curl_cmd]
-    if {$::debug_mode} { save_debug_command $curl curl }
-    set ::werrfile [file join $::CACHE_DIR "scribe-[pid].curl.stderr"]
-    if {[catch {set ::wchan [open "|$curl 2>$::werrfile" r]} err]} {
-        server_transcribe_failed "curl failed to start: $err"; return
-    }
-    set ::wbuf ""
-    fconfigure $::wchan -blocking 0
-    fileevent $::wchan readable transcribe_server_collect
+    if {[catch {
+        http_init
+        set fh [open $::tmpfile rb]; set wav [read $fh]; close $fh
+    } err]} { server_transcribe_failed "could not prepare the request: $err"; return }
+    set boundary "scribe-[clock microseconds]"
+    set body [server_request_body $wav $boundary]
+    set ::wtotal [string length $body]; set ::wsent 0
+    set ::wup_ms [clock milliseconds]; set ::wdone_ms 0
+    # A failure can reach the callback before geturl returns; "pending" lets the
+    # callback act on it and tells this proc not to install the finished token.
+    set ::wtok pending
+    set ::wdog_id [after 1000 transcribe_server_watch]
+    if {[catch {
+        set tok [http::geturl [server_inference_url] -method POST \
+            -type "multipart/form-data; boundary=$boundary" -query $body \
+            -queryblocksize 65536 -queryprogress transcribe_server_progress \
+            -command transcribe_server_done]
+    } err]} { transcribe_server_abort "request failed to start: $err"; return }
+    if {$::wtok eq "pending"} { set ::wtok $tok }
 }
-proc transcribe_server_collect {} {
-    append ::wbuf [read $::wchan]
-    if {![eof $::wchan]} return
-    fileevent $::wchan readable {}
-    fconfigure $::wchan -blocking 1
-    if {[catch {close $::wchan} cerr]} {
-        # curl exit 7 = connection refused, 28 = timeout, 22 = HTTP >= 400.
-        set tail [whisper_stderr]
-        server_transcribe_failed "curl: $cerr[expr {$tail ne "" ? " ($tail)" : ""}]"
-        return
+# Bytes handed to the kernel, so the count runs a socket buffer (a few MB at
+# most) ahead of what the server has received.
+proc transcribe_server_progress {_tok _total sent} {
+    set ::wsent $sent
+    if {$sent >= $::wtotal && !$::wdone_ms} { set ::wdone_ms [clock milliseconds] }
+}
+# Before the first byte leaves: the connect budget. While uploading: the pace,
+# projected to the whole body, past the grace period. Once the upload is in: the
+# server's response budget, which covers the transcription itself.
+proc transcribe_server_watch {} {
+    set ::wdog_id ""
+    set now [clock milliseconds]
+    set up_s [expr {($now - $::wup_ms) / 1000.0}]
+    if {$::wdone_ms} {
+        if {($now - $::wdone_ms) / 1000.0 > $::WHISPER_TIMEOUT_S} {
+            set why "no response ${::WHISPER_TIMEOUT_S}s after the upload finished"
+        }
+    } elseif {$::wsent == 0} {
+        if {$up_s > $::WHISPER_CONNECT_TIMEOUT_S} { set why "no connection within ${::WHISPER_CONNECT_TIMEOUT_S}s" }
+    } elseif {$up_s >= $::WHISPER_UPLOAD_GRACE_S && $up_s * $::wtotal / $::wsent > $::WHISPER_UPLOAD_MAX_S} {
+        set why "upload too slow: [expr {100 * $::wsent / $::wtotal}]% sent in [expr {int($up_s)}]s"
     }
+    if {[info exists why]} { transcribe_server_abort $why; return }
+    set ::wdog_id [after 1000 transcribe_server_watch]
+}
+proc transcribe_server_abort {why} {
+    if {$::wdog_id ne ""} { after cancel $::wdog_id; set ::wdog_id "" }
+    set tok $::wtok
+    set ::wtok ""
+    if {$tok ni {"" pending}} { catch {http::reset $tok} }
+    server_transcribe_failed $why
+}
+proc transcribe_server_done {tok} {
+    # An empty ::wtok means the watchdog already gave this request up; its reset
+    # lands here too.
+    if {$::wtok eq ""} { after idle [list http::cleanup $tok]; return }
+    set ::wtok ""
+    if {$::wdog_id ne ""} { after cancel $::wdog_id; set ::wdog_id "" }
+    set status [http::status $tok]
+    set ncode  [http::ncode $tok]
+    set data   [encoding convertfrom utf-8 [http::data $tok]]
+    set err    [lindex [http::error $tok] 0]
+    after idle [list http::cleanup $tok]
+    if {$status ne "ok"} { server_transcribe_failed "$status[expr {$err ne "" ? ": $err" : ""}]"; return }
+    if {$ncode != 200}   { server_transcribe_failed "HTTP $ncode: [string range [string trim $data] 0 499]"; return }
     if {[catch {
         package require json
-        set text [dict get [json::json2dict $::wbuf] text]
+        set text [dict get [json::json2dict $data] text]
     } perr]} {
         server_transcribe_failed "unreadable server response: $perr"; return
     }
-    if {!$::debug_mode} { catch {file delete $::werrfile} }
     transcribe_succeeded $text
 }
 # A server request that never produced a usable transcript. With fallback on, log
 # it and run the local backend; otherwise surface it. An empty-but-valid transcript
 # is NOT a failure (handled in transcribe_succeeded), so silence does not fall back.
 proc server_transcribe_failed {reason} {
-    if {!$::debug_mode} { catch {file delete $::werrfile} }
     if {$::WHISPER_FALLBACK} {
         logsys notice "whisper-server ($::WHISPER_SERVER) failed ($reason); falling back to local whisper-cli"
         transcribe_local
@@ -1991,10 +2048,10 @@ proc run_self_test {} {
     set ::WHISPER_SERVER ""
     check "transcribe_use_server off"   {![transcribe_use_server]}
     set ::WHISPER_SERVER "http://localhost:8080/"; set _tf $::tmpfile; set ::tmpfile "/tmp/x.wav"
-    set _curl [build_server_curl_cmd]
-    check "curl posts the wav"    {[lsearch -exact $_curl "file=@/tmp/x.wav"] >= 0}
-    check "curl asks json"        {[lsearch -exact $_curl "response_format=json"] >= 0}
-    check "curl hits /inference"  {[lindex $_curl end] eq "http://localhost:8080/inference"}
+    check "server hits /inference" {[server_inference_url] eq "http://localhost:8080/inference"}
+    set _body [server_request_body "RIFF\x00\xff" B]
+    check "server posts the wav"   {[string first "name=\"file\"; filename=\"x.wav\"\r\nContent-Type: audio/wav\r\n\r\nRIFF\x00\xff\r\n--B--\r\n" $_body] >= 0}
+    check "server asks json"       {[string first "name=\"response_format\"\r\n\r\njson\r\n" $_body] >= 0}
     set ::tmpfile $_tf; set ::WHISPER_SERVER $_sv; set ::WHISPER_FALLBACK $_fb; set ::MODEL $_md
 
     set ::sourceText "src"; set ::rewriteText "rw"; setActiveArea 1

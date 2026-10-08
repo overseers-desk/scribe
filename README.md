@@ -1,237 +1,91 @@
 # Scribe
 
-A hotkey-invoked desktop tool that takes text you type, dictate, or hold on the
-clipboard, optionally restyles it with an LLM, and delivers it by typing,
-pasting, or leaving it on the clipboard.
+Press a shortcut, speak, press it again, and what you said is typed or pasted into the app you were working in. Transcription runs on your own machine with whisper.cpp, or on a whisper server you run yourself. There is no account to create, and no API key is needed.
 
-Its behaviour is five independent flags, so the command line states exactly what
-will happen:
+Scribe can also take text from the clipboard or from its own window. If you connect an AI provider (DeepSeek, Claude, ChatGPT, a local Ollama model), a Rewrite button tidies dictation that rambles or corrects itself, and can restyle it with a style guide of your choosing. Without a provider, scribe is a plain dictation tool.
 
-```
---input keyboard|voice|clipboard where the text comes from (default keyboard)
---window | --no-window           show a review window, or run unattended
---deliver type|paste|clipboard|stdout  how the result leaves (stdout prints it)
---style[=NAME]                   apply a style pass (needs a configured AI provider)
---provider NAME                  pick a [provider.NAME] from config.ini
---quotes double|single|straight  quotation style (default double)
---dialect off|british            British spelling conversion (default off)
-```
-
-The style pass is the only feature that needs an API key. With no configuration
-and no key, scribe still runs as a dictation tool — the style pass and the styled
-review pane are simply absent.
+Scribe runs on Linux (PipeWire, Wayland or X11) and macOS. The macOS typing and pasting paths have not yet been tested on real hardware.
 
 ## Install
-
-Homebrew (Linux and macOS):
 
 ```
 brew tap overseers-desk/od
 brew install scribe
 ```
 
-On macOS the formula pulls `sox` for audio capture; keystrokes and clipboard go
-through the system's own `osascript` and `pbcopy`. On Linux the formula installs
-scribe and Tcl/Tk only. For `--input voice`, install whisper.cpp separately
-(`brew install whisper-cpp` provides `whisper-cli`) and supply a whisper model
-file such as `ggml-medium.en.bin`, named in the `[whisper]` section of
-`config.ini` or passed with `--model`. On Linux, a recorder (`pw-record`, or `sox`
-as fallback) and `dotool` must also be on `PATH` (see Dependencies below).
+This installs the `scribe` command and Tcl/Tk 9. Dictation also needs:
 
-## Dependencies
+- **whisper.cpp**, for `whisper-cli`: `brew install whisper-cpp`.
+- **A whisper model file**, such as `ggml-medium.en.bin` from the [whisper.cpp models](https://huggingface.co/ggerganov/whisper.cpp). Scribe has no default model; you point it at the file.
 
-Runtime commands (must be on `PATH`):
+On Linux, also install from your distribution:
 
-| Command | Provides | Needed for |
-|---------|----------|------------|
-| `whisper-cli` | speech-to-text (whisper.cpp) | `--input voice`, local transcription |
-| `pw-record` | audio capture (PipeWire; preferred on Linux) | `--input voice` |
-| `sox` | audio capture (macOS via coreaudio; Linux fallback when pw-record is absent) | `--input voice` |
-| `dotool` | keystroke injection via uinput (Linux) | `--deliver type`, and the paste keystroke |
+- `pw-record` (PipeWire) to record, or `sox` if you don't use PipeWire.
+- `dotool` to type and paste. It writes to `/dev/uinput`, which usually means adding yourself to the `input` group. For the group change, run `sudo usermod -aG input $USER`, then log out and back in.
+- `wl-copy` (Wayland) or `xclip` (X11) for the clipboard.
+- IBus or fcitx running, if you dictate characters outside ASCII (curly quotes, accented names) with `--deliver type`.
 
-On macOS, keystrokes go through `osascript` (System Events) and the clipboard
-through `pbcopy`/`pbpaste`, both of which ship with the OS. Grant the app that
-launches scribe (e.g. your terminal) **Accessibility** permission for
-typing/pasting and **Microphone** permission for recording, under System
-Settings → Privacy & Security.
+On macOS, Homebrew pulls in `sox`. Typing and the clipboard go through the system's own `osascript` and `pbcopy`. Give the app that launches scribe (your terminal, or the shortcut tool) **Accessibility** and **Microphone** permission under System Settings → Privacy & Security.
 
-Other requirements:
+From a source checkout (`git clone https://github.com/overseers-desk/scribe`), run `scribe.tcl` with a Tcl/Tk 9 `wish9.0` that has `tk systray`, TclTLS, and tcllib's `json`, `yaml` and `csv`.
 
-- **Tcl/Tk 9** with a working `wish9.0` and `tk systray`. The Tcl packages
-  `http`, `tls`, `json`, `yaml`, and `csv` must be available to that
-  interpreter. On Ubuntu those were provided by tcllib. With OS X brew they
-  came with tcl9.
+## First dictation
 
-- A **whisper model** file (for example `ggml-medium.en.bin`) for `--input
-  voice`, named in the `[whisper]` section of `config.ini` (`model = ...`) or
-  passed with `--model`. There is no built-in default path.
+```
+scribe --input voice --model /path/to/ggml-medium.en.bin
+```
 
-- An **AI provider** in `config.ini`, only for `--style` (optional; see below).
-- `dotool` needs access to `/dev/uinput` (typically membership of the `input`
-  group). For non-ASCII characters (curly quotes, accented names) the `--deliver
-  type` path uses IBus Ctrl+Shift+U, so IBus (or fcitx) should be running.
+Recording starts at once, and the tray icon shows a red pie counting down the time left. Speak, then stop by running the same command again or clicking the tray icon. Recording stops on its own after five minutes (`--timeout` changes this). The transcript opens in a window. Press Space to paste it into the app you were in, or Escape to discard it.
 
-## Setup
+Scribe keeps each recording and its transcript in `/var/local/log/dictation/` when that folder exists and is writable.
 
-1. (Optional, only for `--style`) Copy `config.example.ini` to
-   `~/.config/scribe/config.ini` and fill in a provider:
-
-   ```ini
-   default_provider = deepseek
-
-   [provider.deepseek]
-   api_key  = sk-your-key-here
-   model    = deepseek-chat
-   api_base = https://api.deepseek.com
-   ```
-
-   Add more `[provider.NAME]` sections (e.g. `claude`, `chatgpt`, a local Ollama
-   model) and pick one with
-   `--provider NAME` or `default_provider`. Skip this entirely to run dictation
-   only. A legacy single-provider `deepseek.json` is still honoured if present.
-
-2. Bind the presets you want to global shortcuts (GNOME custom keyboard
-   shortcuts, or your desktop's equivalent).
-
-   A second press of a `--input voice` shortcut stops the recording started by the first.
-
-   For example, to bind dictation to the `Insert` key under GNOME, add a custom
-   keybinding whose command is:
-
-   ```
-     code/scribe/scribe.tcl --input voice --deliver paste --dialect british \
-     --timeout 300 --window --model code/whisper.cpp/models/ggml-medium.en.bin \
-     --prompt-file ~/.whisper-prompt-file
-   ```
-
-   ```sh
-   dir=/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom0/
-   base=org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$dir
-   gsettings set org.gnome.settings-daemon.plugins.media-keys custom-keybindings "['$dir']"
-   gsettings set "$base" name 'Insert Voice Message'
-   gsettings set "$base" binding 'Insert'
-   gsettings set "$base" command '[the above launch command]'
-   ```
-
-## Presets
-
-| Goal | Command |
-|------|---------|
-| Dictate straight into the focused window | `scribe.tcl --input voice --no-window --deliver type` |
-| Dictate, review, then paste | `scribe.tcl --input voice --window --style --auto-style-delay 1000 --deliver paste` |
-| Restyle the clipboard, review, copy back | `scribe.tcl --input clipboard --window --style --auto-style-delay 1 --deliver clipboard` |
-
-With no `--input`, scribe defaults to `keyboard`: it opens an empty window for you
-to type into. `--no-window` needs `--input voice` or `--input clipboard`, since
-there is nothing to type into without a window.
-
-## Review window
-
-When a window is shown it has two panes, the dictated text and the result,
-with one highlighted, and the history list down the left. The rewrite controls
-and the result pane appear only when a provider is configured. Both panes are
-editable: click into one to correct the text before rewriting or delivering.
-
-A **Listen** button in the pane header records from the window itself: press,
-dictate, and press again (or Escape) to stop. The transcript lands in the
-pane, appended after any text already there. It covers windows opened without
-`--input voice`, and the global shortcut's second press stops it like any
-other recording.
-
-Between the panes, two rows of radios pick what a Rewrite click does. Both
-choices are remembered between runs, and unattended (`--no-window --style`)
-runs use them too.
-
-- **Style**: "No style" (the default) runs the clean-up alone; picking a style
-  applies its guide on top of the clean-up. The clean-up repairs what
-  composing in one take leaves behind: repeated versions of a point merged
-  into the fullest one, mid-stream self-corrections resolved, and points
-  reordered into the sequence the author would have chosen (a prerequisite
-  recalled late moves ahead of what depends on it).
-- **Passes** (greyed under "No style", where it is moot): **2 — clean up,
-  then style** (the default) repairs first, then restyles the repaired text;
-  the source pane keeps the raw dictation, and the result pane shows the
-  repaired text until the styled text replaces it. **1 — merged prompt** does
-  both in one call. Best on a reasoning model: set `thinking_model` in the
-  provider's config section, otherwise the call goes to the provider's
-  regular `model`.
-
-The keys depend on focus. With the window itself focused (as it opens after voice
-or clipboard input), Space delivers, Enter delivers and then sends a return, and
-Up/Down switch the highlighted pane. Once you click into a pane to edit, Space and
-Enter type normally; deliver with Ctrl+Enter or the button. Escape closes without
-pasting and throws the text away; Shift+Escape closes without pasting and keeps
-the text in history. Closing the window (or the Copy button) copies to the
-clipboard first. In keyboard mode the window opens with the cursor already in the
-pane, ready to type.
-
-### History
-
-Every text scribe delivers is kept. **Shift+Escape** keeps one without
-delivering it: the window closes, nothing is pasted, and the entry is listed
-with a `*` to say it has not been used yet. The list runs down the left of the
-window, newest first, showing the time and the opening words of each entry.
-Selecting one brings it back into the panes, both the dictation and its rewrite,
-ready to edit or deliver. Deliver it and the `*` goes.
-
-Entries live in `history.tsv` under `~/.local/state/scribe/`, four
-tab-separated columns: date, mark, original, rewrite. Line breaks inside an
-entry are stored as carriage returns, so one entry is always one line and the
-file reads in anything that reads TSV. The newest 999 entries are kept; when it
-fills, the oldest entry without a `*` goes first, so text set aside outlasts the
-ordinary deliveries piling up in front of it.
-
-## Text normalisation
-
-- `--quotes` rewrites straight quotes: `double` gives “ ” and ’, `single` gives
-  ‘ ’ and ’, `straight` leaves ASCII. `--dialect british` makes `single` the
-  default unless `--quotes` is given.
-- `--dialect british` converts US spelling to British using
-  `dialect-us-to-british.tsv` plus `-ize`/`-ise` suffix rules. There is no `us`
-  target on purpose; see the comment in `scribe.tcl` for why.
-
-## Configuration files
-
-- `config.ini` (`~/.config/scribe/`): AI providers for the style pass, and an
-  optional `[whisper]` transcription backend. Optional; `[provider.NAME]` sections
-  plus `default_provider`, and `[whisper]` `server_url`/`fallback_local`. See
-  `config.example.ini`.
-- `styles/*.txt`: style guides, one per file; the name is the `--style` value.
-- `current-mode.conf`: the last-used style name, used when `--style` has no name.
-- `system-prompts.yaml`: the wrapper text around the style guide and user text.
-- `dialect-us-to-british.tsv`: US to British spelling pairs.
-
-## Transcription backends
-
-By default scribe transcribes locally with `whisper-cli`. To offload transcription
-to a whisper.cpp `whisper-server` (on this or another machine), add a `[whisper]`
-section to `config.ini`, or pass `--whisper-server URL`:
+To skip the `--model` flag, name the model once in `~/.config/scribe/config.ini`:
 
 ```ini
 [whisper]
-model      = /path/to/ggml-medium.en.bin   # local transcription (or pass --model)
-server_url = http://localhost:8080         # or offload to a server
-fallback_local = true                      # if it is down, use whisper-cli
+model = /path/to/ggml-medium.en.bin
 ```
 
-You run the server yourself (scribe only reaches the URL). With `fallback_local`, keep `model` set (or pass `--model`) so the local
-path can take over. For purely local transcription, set `model` and leave
-`server_url` out.
+## Put it on a key
 
-To test the loop headlessly (e.g. over SSH, where there is no display), pair
-`--deliver stdout` with a virtual display: `xvfb-run -a scribe.tcl --input voice
---test-file sample.wav --no-window --deliver stdout` prints the transcript instead
-of typing or pasting it. scribe is a Tk app, so it still needs a display; `xvfb-run`
-supplies a throwaway one.
+Bind the command to a global shortcut in your desktop's keyboard settings. Pressing the shortcut a second time stops the recording. For example, under GNOME, to dictate with the Insert key:
 
-## Self-test
-
-```
-wish9.0 scribe.tcl --self-test
+```sh
+dir=/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom0/
+base=org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$dir
+gsettings set org.gnome.settings-daemon.plugins.media-keys custom-keybindings "['$dir']"
+gsettings set "$base" name 'Dictate'
+gsettings set "$base" binding 'Insert'
+gsettings set "$base" command 'scribe --input voice --deliver paste'
 ```
 
-Runs the quote, dialect, injection, delivery, validation, rewrite-pipeline
-(all three style/passes combinations, when a provider is configured),
-second-press protocol, clipboard, and UI checks without a microphone, and
-exits with the result.
-`--test-text "…"` drives the window with fixed text instead of the mic.
+The command relies on the model named in `config.ini` above; otherwise add `--model`. This snippet replaces any custom shortcuts you already have; if you have some, add the shortcut in Settings → Keyboard instead.
+
+## Common setups
+
+| You want to | Command |
+|-------------|---------|
+| Dictate straight into the focused app, no window | `scribe --input voice --no-window --deliver type` |
+| Dictate, check the text, then paste | `scribe --input voice --deliver paste` |
+| Dictate, have it tidied by AI, then paste | `scribe --input voice --style --auto-style-delay 1000 --deliver paste` |
+| Restyle the clipboard and copy it back | `scribe --input clipboard --style --auto-style-delay 1 --deliver clipboard` |
+| Type into a window, then paste | `scribe` |
+
+`--dialect british` converts US spelling to British; `--quotes` picks curly or straight quotation marks. `scribe --help` lists every option.
+
+## Optional: AI clean-up and styles
+
+Copy `config.example.ini` to `~/.config/scribe/config.ini` and fill in one provider:
+
+```ini
+[provider.deepseek]
+api_key  = sk-your-key-here
+model    = deepseek-chat
+api_base = https://api.deepseek.com
+```
+
+The window then gains a second pane and a Rewrite button. Rewrite merges repeated points, resolves mid-sentence corrections, and puts points in a sensible order. Pick a style to restyle the result as well. Styles are plain-text guides in the `styles` folder, and you can add your own. `config.example.ini` shows other providers, a local Ollama model, and transcription on a whisper server.
+
+## More
+
+[docs/reference.md](docs/reference.md) covers the review window's keys, history, the configuration files, transcription on a server, and testing.

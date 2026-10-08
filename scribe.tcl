@@ -1463,25 +1463,27 @@ image delete $::_probe
 set ::TWOPI [expr {2.0 * acos(-1.0)}]
 set ::icon_image [image create photo -width $::ICON_SIZE -height $::ICON_SIZE]
 set ::BLINK_MS 1000
+set ::UPLOAD_TICK_MS 200
 set ::TYPE_BLINK_MS 250
 set ::blink 1
 set ::anim_id ""
 set ::TRANSPARENT_SVG {<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"></svg>}
 
 # Recording glyph: lit = red countdown disc, unlit = transparent (blink to
-# background). First frame is lit, so the icon shows red first.
-proc pie_svg {frac lit} {
+# background). First frame is lit, so the icon shows red first. The upload to
+# whisper-server reuses it in the busy orange, filling as the bytes go out.
+proc pie_svg {frac lit {fill "#dd3333"}} {
     if {!$lit} { return $::TRANSPARENT_SVG }
     set cx 16.0; set cy 16.0; set r 15.5
     set s "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"32\" height=\"32\">"
     append s "<circle cx=\"$cx\" cy=\"$cy\" r=\"$r\" fill=\"#444444\"/>"
     if {$frac >= 0.999} {
-        append s "<circle cx=\"$cx\" cy=\"$cy\" r=\"$r\" fill=\"#dd3333\"/>"
+        append s "<circle cx=\"$cx\" cy=\"$cy\" r=\"$r\" fill=\"$fill\"/>"
     } elseif {$frac > 0.001} {
         set a [expr {$frac * $::TWOPI}]
         set ex [expr {$cx + $r * sin($a)}]; set ey [expr {$cy - $r * cos($a)}]
         set large [expr {$frac > 0.5 ? 1 : 0}]
-        append s "<path d=\"M$cx,$cy L$cx,[expr {$cy - $r}] A$r,$r 0 $large,1 $ex,$ey Z\" fill=\"#dd3333\"/>"
+        append s "<path d=\"M$cx,$cy L$cx,[expr {$cy - $r}] A$r,$r 0 $large,1 $ex,$ey Z\" fill=\"$fill\"/>"
     }
     append s "</svg>"
     return $s
@@ -1505,6 +1507,7 @@ proc draw_icon {frac state lit} {
     switch -- $state {
         styling - transcribing { set svg [busy_svg $lit] }
         typing                 { set svg [type_svg $lit] }
+        uploading              { set svg [pie_svg $frac 1 "#f67400"] }
         default                { set svg [pie_svg $frac $lit] }
     }
     set tmp [image create photo -data $svg -format [list svg -scale $::ICON_SCALE]]
@@ -1520,7 +1523,11 @@ proc animate {} {
     set ms $::BLINK_MS
     switch -- $::state {
         recording    { draw_icon [recording_frac] recording $::blink }
-        transcribing { draw_icon 1.0 transcribing $::blink }
+        transcribing {
+            if {[server_uploading]} {
+                draw_icon [expr {double($::wsent) / $::wtotal}] uploading 1; set ms $::UPLOAD_TICK_MS
+            } else { draw_icon 1.0 transcribing $::blink }
+        }
         styling      { draw_icon 1.0 styling $::blink }
         typing       { draw_icon 1.0 typing $::blink; set ms $::TYPE_BLINK_MS }
         default      { set ::anim_id ""; return }
@@ -1734,6 +1741,7 @@ proc transcribe_server {} {
 }
 # Bytes handed to the kernel, so the count runs a socket buffer (a few MB at
 # most) ahead of what the server has received.
+proc server_uploading {} { expr {$::wtok ne "" && !$::wdone_ms} }
 proc transcribe_server_progress {_tok _total sent} {
     set ::wsent $sent
     if {$sent >= $::wtotal && !$::wdone_ms} { set ::wdone_ms [clock milliseconds] }
@@ -2051,6 +2059,13 @@ proc run_self_test {} {
     check "server hits /inference" {[server_inference_url] eq "http://localhost:8080/inference"}
     set _body [server_request_body "RIFF\x00\xff" B]
     check "server posts the wav"   {[string first "name=\"file\"; filename=\"x.wav\"\r\nContent-Type: audio/wav\r\n\r\nRIFF\x00\xff\r\n--B--\r\n" $_body] >= 0}
+    set _st [list $::wtok $::wdone_ms]
+    set ::wtok tok1; set ::wdone_ms 0
+    check "uploading while the body goes out" {[server_uploading]}
+    set ::wdone_ms 1
+    check "not uploading once it is in"       {![server_uploading]}
+    lassign $_st ::wtok ::wdone_ms
+    check "upload pie in the busy orange"     {[string match "*#f67400*" [pie_svg 0.3 1 "#f67400"]] && ![string match "*#dd3333*" [pie_svg 0.3 1 "#f67400"]]}
     check "server asks json"       {[string first "name=\"response_format\"\r\n\r\njson\r\n" $_body] >= 0}
     set ::tmpfile $_tf; set ::WHISPER_SERVER $_sv; set ::WHISPER_FALLBACK $_fb; set ::MODEL $_md
 

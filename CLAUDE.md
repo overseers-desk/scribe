@@ -67,7 +67,7 @@ Every delivery, and every Shift+Escape, commits the pair `{original, revised}` t
 `history.tsv` beside the `style` and `pipeline` state files. `deliver_now` is the
 one funnel for all four delivery modes, so it carries the `history_commit` call;
 the two paths reaching the clipboard without it (the Copy button,
-`WM_DELETE_WINDOW`) carry their own. Shift+Escape commits with the mark set and
+`WM_DELETE_WINDOW`) share `copy_and_close`, which carries its own. Shift+Escape commits with the mark set and
 delivers nothing; mid-recording it stops the recording as Escape does, so a
 mis-hit cannot take a recording down.
 

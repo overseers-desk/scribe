@@ -1098,6 +1098,15 @@ proc deliver_now {text {withEnter 0}} {
         }
     }
 }
+# The Copy button and the window's close box leave the text on the clipboard
+# without going through deliver_now, so they commit and log for themselves.
+proc copy_and_close {} {
+    history_commit 0
+    set text [active_text]
+    logsys notice "copying [string length $text] chars to the clipboard"
+    set_clipboard $text
+    finish 0
+}
 proc do_paste_exec {withEnter} {
     if {$::MACOS} {
         # Cmd+V through System Events; needs Accessibility permission.
@@ -1307,7 +1316,7 @@ proc build_review_ui {} {
         ttk::button .btns.rewrite -text "Rewrite" -command rewrite_or_prompt -takefocus 0
         pack .btns.rewrite -side left -padx 4
     }
-    ttk::button .btns.copy -text "Copy to clipboard" -command {history_commit 0; set_clipboard [active_text]; finish 0} -takefocus 0
+    ttk::button .btns.copy -text "Copy to clipboard" -command copy_and_close -takefocus 0
     pack .btns.copy -side left -padx 4
     pack [ttk::label .btns.keys -foreground #98989d \
               -text "Esc discard · Shift+Esc keep in history"] -side right -padx 4
@@ -1330,7 +1339,7 @@ proc build_review_ui {} {
         bind . <Up>   {if {![typing_focus]} {setActiveArea 1; break}}
         bind . <Down> {if {![typing_focus]} {setActiveArea 2; break}}
     }
-    wm protocol . WM_DELETE_WINDOW {history_commit 0; set_clipboard [active_text]; finish 0}
+    wm protocol . WM_DELETE_WINDOW copy_and_close
     refresh_highlight
     log_scaling review-build
 }

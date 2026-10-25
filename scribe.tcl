@@ -978,10 +978,13 @@ proc clip_backend {} {
 # out of its argument words before the program runs, so text of ">>" or "> foo"
 # passed as an argument is a Tcl redirect, not text. Transcripts do reach that
 # shape — a near-silent recording transcribes as the two characters ">>".
+# wl-copy is told the text is text: left to guess, it sniffs the content, and a
+# dictation opening "From " is offered as application/mbox alone, which no
+# paste target asks for, so the paste comes up empty.
 proc set_clipboard {txt} {
     switch -- [clip_backend] {
         macos   { exec pbcopy << $txt }
-        wayland { exec wl-copy << $txt }
+        wayland { exec wl-copy --type text/plain\;charset=utf-8 << $txt }
         x11     {
             # xclip daemonises to hold the X11 selection; redirect its
             # stdout/stderr off Tcl's pipe or exec blocks waiting for the
@@ -2131,8 +2134,9 @@ proc run_self_test {} {
 
     set ::DELIVER clipboard
     # A near-silent recording transcribes as ">>", which reaches the clipboard as
-    # a whole transcript (see set_clipboard for why that shape once broke it).
-    foreach _probe {round-trip-probe >>} {
+    # a whole transcript, and a dictation opening "From " once reached it as a
+    # mailbox (see set_clipboard for both).
+    foreach _probe {round-trip-probe >> {From memory, a dictation}} {
         if {[catch {set_clipboard $_probe}]} {
             check "clipboard write of \"$_probe\"" 0
             continue
@@ -2140,7 +2144,7 @@ proc run_self_test {} {
         set back ""
         switch -- [clip_backend] {
             macos   { catch {set back [exec pbpaste]} }
-            wayland { catch {set back [exec wl-paste -n]} }
+            wayland { catch {set back [exec wl-paste -n --type text/plain]} }
             x11     { catch {set back [exec xclip -selection clipboard -o]} }
         }
         check "clipboard round-trip of \"$_probe\"" {$back eq $_probe}
